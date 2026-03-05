@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "columnar",
+    "columnar-derive"
+,
+    "columnar-tests"
+]

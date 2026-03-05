@@ -1,0 +1,9 @@
+[package]
+name = "columnar-tests"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+columnar-derive = { path = "../columnar-derive"}
+columnar = { path = "../columnar"}
