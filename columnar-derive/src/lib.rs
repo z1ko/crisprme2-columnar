@@ -58,7 +58,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         Span::call_site(),
     );
 
-    // Column inddices in order of declaration
+    // Column indices in order of declaration
     let col_indices: Vec<proc_macro2::Literal> = (0..field_names.len())
         .map(proc_macro2::Literal::usize_suffixed)
         .collect();

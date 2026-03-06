@@ -273,7 +273,7 @@ macro_rules! impl_columns {
             type Output    = ( $( &'buffer     [$C::Value], )+ );
 
             fn get_mut(self, buffer: &'buffer mut ColumnarBuffer<S>) -> Self::OutputMut {
-                let ranges: &[(usize, usize)] = &[
+                let ranges: &[std::ops::Range<usize>] = &[
                     $( buffer.column_content_range(&self.$idx), )+
                 ];
 
@@ -283,8 +283,8 @@ macro_rules! impl_columns {
                 while i < ranges.len() {
                     let mut j = i + 1;
                     while j < ranges.len() {
-                        if ranges[i] == ranges[j] { 
-                            assert!(false, "duplicate columns requested, would alias mutable references");
+                        if ranges[i] == ranges[j] {
+                            panic!("duplicate columns requested, would alias mutable references");
                         }
                         j += 1;
                     }
@@ -299,20 +299,20 @@ macro_rules! impl_columns {
                 ($(
                     bytemuck::cast_slice_mut(unsafe {
                         std::slice::from_raw_parts_mut(
-                            data.add(ranges[$idx].0),
-                            ranges[$idx].1 - ranges[$idx].0,
+                            data.add(ranges[$idx].start),
+                            ranges[$idx].len(),
                         )
                     }),
                 )+)
             }
 
             fn get(self, buffer: &'buffer ColumnarBuffer<S>) -> Self::Output {
-                let ranges: &[(usize, usize)] = &[
+                let ranges: &[std::ops::Range<usize>] = &[
                     $( buffer.column_content_range(&self.$idx), )+
                 ];
                 ($(
                     bytemuck::cast_slice(
-                        &buffer.ring_slot.data[ranges[$idx].0 .. ranges[$idx].1]
+                        &buffer.ring_slot.data[ranges[$idx].clone()]
                     ),
                 )+)
             }
@@ -321,14 +321,14 @@ macro_rules! impl_columns {
 }
 
 // Generate Columns impls for tuple arities 1 through 8.
-impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4), (5, C5), (6, C6), (7, C7));
-impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4), (5, C5), (6, C6));
-impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4), (5, C5));
-impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4));
-impl_columns!((0, C0), (1, C1), (2, C2), (3, C3));
-impl_columns!((0, C0), (1, C1), (2, C2));
-impl_columns!((0, C0), (1, C1));
 impl_columns!((0, C0));
+impl_columns!((0, C0), (1, C1));
+impl_columns!((0, C0), (1, C1), (2, C2));
+impl_columns!((0, C0), (1, C1), (2, C2), (3, C3));
+impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4));
+impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4), (5, C5));
+impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4), (5, C5), (6, C6));
+impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4), (5, C5), (6, C6), (7, C7));
 
 // =============================================================================
 // ColumnarBuffer
@@ -402,10 +402,9 @@ impl<S: Schema> ColumnarBuffer<S> {
     ///
     /// This is the range used by [`columns`](ColumnarBuffer::columns) and
     /// [`mutate`](ColumnarBuffer::mutate) to construct column slices.
-    pub fn column_content_range<C: ColumnType>(&self, col: &C) -> (usize, usize) {
+    pub fn column_content_range<C: ColumnType>(&self, col: &C) -> std::ops::Range<usize> {
         let beg = col.offset(self.row_capacity);
-        let end = beg + self.row_count * col.elem_size();
-        (beg, end)
+        beg..beg + self.row_count * col.elem_size()
     }
 
     /// Return the byte range `[start, end)` covering the **full allocated block**
@@ -413,10 +412,9 @@ impl<S: Schema> ColumnarBuffer<S> {
     ///
     /// Includes unwritten rows. Useful when handing the buffer to external
     /// code (e.g. CUDA kernels) that will fill the entire block directly.
-    pub fn column_capacity_range<C: ColumnType>(&self, col: &C) -> (usize, usize) {
-        let beg: usize = col.offset(self.row_capacity);
-        let end = beg + self.row_capacity * col.elem_size();
-        (beg, end)
+    pub fn column_capacity_range<C: ColumnType>(&self, col: &C) -> std::ops::Range<usize> {
+        let beg = col.offset(self.row_capacity);
+        beg..beg + self.row_capacity * col.elem_size()
     }
 
     // ── Read access ───────────────────────────────────────────────────────────
