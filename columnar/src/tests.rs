@@ -49,10 +49,25 @@ mod wide {
     }
 }
 
+// Declaration order: a(u8, align 1), b(u32, align 4), c(u8, align 1)
+// Expected block order: b first (align 4), then a and c (align 1, stable)
+mod scrambled {
+    use super::*;
+    use columnar_derive::Columnar;
+    #[repr(C)]
+    #[derive(Debug, Clone, PartialEq, Columnar)]
+    pub struct Scrambled {
+        pub a: u8,
+        pub b: u32,
+        pub c: u8,
+    }
+}
+
 use point::{Point, PointSchema, schema as ps};
 use record::{Record, RecordSchema, schema as rs};
 use single::{Single, SingleSchema, schema as ss};
 use wide::{Wide, WideSchema, schema as ws};
+use scrambled::{Scrambled, ScrambledSchema, schema as scr};
 
 fn point_buf(rows: usize) -> Columnar<PointSchema, RingSlot> {
     RingSlot::new(rows * PointSchema::stride()).columnar()
@@ -542,4 +557,95 @@ fn push_mutate_get_consistent() {
             "row {i}: expected {}, got {}", i as f32 * 0.2, r.score);
         assert_eq!(r.id, i);
     }
+}
+
+// =============================================================================
+// Alignment-sorted layout verification
+// =============================================================================
+
+// Scrambled { a: u8 (align 1), b: u32 (align 4), c: u8 (align 1) }
+// Expected BLOCK_ORDER   = [1, 0, 2]  (b first, then a, then c)
+// Expected FIELD_TO_BLOCK = [1, 0, 2]  (field a→block 1, b→block 0, c→block 2)
+// Expected BLOCK_OFFSETS  = [0, 4, 5]  (b at 0, a at 4*cap, c at 5*cap)
+
+#[test]
+fn scrambled_field_to_block() {
+    assert_eq!(ScrambledSchema::BLOCK_ORDER,    [1, 0, 2]);
+    assert_eq!(ScrambledSchema::FIELD_TO_BLOCK, [1, 0, 2]);
+}
+
+#[test]
+fn scrambled_block_offsets() {
+    // block 0 (b, u32, size 4): prefix[0] = 0
+    // block 1 (a, u8,  size 1): prefix[1] = 0 + ELEM_SIZES[BLOCK_ORDER[0]] = 0 + 4 = 4
+    // block 2 (c, u8,  size 1): prefix[2] = 4 + ELEM_SIZES[BLOCK_ORDER[1]] = 4 + 1 = 5
+    assert_eq!(ScrambledSchema::BLOCK_OFFSETS, [0, 4, 5]);
+    assert_eq!(ScrambledSchema::STRIDE, 6);
+}
+
+#[test]
+fn scrambled_block_offsets_aligned_for_any_capacity() {
+    // Block 0 (b, u32, align 4): offset = 0 * cap → always aligned to 4.
+    // Block 1 (a, u8,  align 1): offset = 4 * cap → always aligned to 1.
+    // Block 2 (c, u8,  align 1): offset = 5 * cap → always aligned to 1.
+    for cap in [1usize, 2, 3, 4, 7, 8, 13, 16, 100] {
+        let off_b = ScrambledSchema::offset(0, cap);
+        let off_a = ScrambledSchema::offset(1, cap);
+        let off_c = ScrambledSchema::offset(2, cap);
+        assert_eq!(off_b % 4, 0, "b block misaligned at cap={cap}");
+        assert_eq!(off_a % 1, 0, "a block misaligned at cap={cap}");
+        assert_eq!(off_c % 1, 0, "c block misaligned at cap={cap}");
+    }
+}
+
+#[test]
+fn scrambled_raw_layout() {
+    // 4-row Scrambled buffer (stride=6, total=24 bytes rounded to 24)
+    // block 0 (b): bytes  0..16 = [b0, b1, b2, b3] (4 * 4)
+    // block 1 (a): bytes 16..20 = [a0, a1, a2, a3] (4 * 1)
+    // block 2 (c): bytes 20..24 = [c0, c1, c2, c3] (4 * 1)
+    let rows = 4usize;
+    let mut buf: Columnar<ScrambledSchema, RingSlot> =
+        RingSlot::new(rows * ScrambledSchema::STRIDE).columnar();
+    buf.push(Scrambled { a: 10, b: 100, c: 200 });
+    buf.push(Scrambled { a: 11, b: 101, c: 201 });
+    buf.push(Scrambled { a: 12, b: 102, c: 202 });
+    buf.push(Scrambled { a: 13, b: 103, c: 203 });
+
+    let raw = buf.buffer.as_bytes();
+    let bs: &[u32] = bytemuck::cast_slice(&raw[0..16]);
+    let a_block = &raw[16..20];
+    let c_block = &raw[20..24];
+    assert_eq!(bs,      &[100u32, 101, 102, 103]);
+    assert_eq!(a_block, &[10u8,   11,  12,  13]);
+    assert_eq!(c_block, &[200u8,  201, 202, 203]);
+}
+
+#[test]
+fn scrambled_push_get_round_trip() {
+    let mut buf: Columnar<ScrambledSchema, RingSlot> =
+        RingSlot::new(4 * ScrambledSchema::STRIDE).columnar();
+    let rows = [
+        Scrambled { a: 1, b: 1000, c: 100 },
+        Scrambled { a: 2, b: 2000, c: 200 },
+        Scrambled { a: 3, b: 3000, c: 255 },
+    ];
+    for r in &rows { buf.push(r.clone()); }
+    for (i, expected) in rows.iter().enumerate() {
+        assert_eq!(&buf.get::<Scrambled>(i).unwrap(), expected);
+    }
+}
+
+#[test]
+fn scrambled_columns_access() {
+    let mut buf: Columnar<ScrambledSchema, RingSlot> =
+        RingSlot::new(3 * ScrambledSchema::STRIDE).columnar();
+    buf.push(Scrambled { a: 7, b: 77, c: 17 });
+    buf.push(Scrambled { a: 8, b: 88, c: 18 });
+    buf.push(Scrambled { a: 9, b: 99, c: 19 });
+
+    let (a_col, b_col, c_col) = buf.columns((scr::a, scr::b, scr::c));
+    assert_eq!(a_col, &[7u8,   8,  9]);
+    assert_eq!(b_col, &[77u32, 88, 99]);
+    assert_eq!(c_col, &[17u8,  18, 19]);
 }

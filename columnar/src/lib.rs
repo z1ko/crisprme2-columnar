@@ -93,14 +93,17 @@ impl ByteBuffer for Vec<u8> {
 
 /// A plain heap-allocated byte slab intended to be used as a slot in a ring
 /// buffer pool, but usable as a standalone backing store for [`Columnar`].
+///
+/// The backing allocation is `Vec<u64>` (8-byte aligned) so that all standard
+/// primitive column types are naturally aligned regardless of `row_capacity`.
 pub struct RingSlot {
-    pub data: Vec<u8>
+    pub data: Vec<u64>
 }
 
 impl RingSlot {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(bytes: usize) -> Self {
         Self {
-            data: vec![0u8; capacity]
+            data: vec![0u64; bytes.div_ceil(8)]
         }
     }
 
@@ -111,8 +114,8 @@ impl RingSlot {
 }
 
 impl ByteBuffer for RingSlot {
-    fn as_bytes(&self) -> &[u8] { &self.data }
-    fn as_bytes_mut(&mut self) -> &mut [u8] { &mut self.data }
+    fn as_bytes(&self) -> &[u8] { bytemuck::cast_slice(&self.data) }
+    fn as_bytes_mut(&mut self) -> &mut [u8] { bytemuck::cast_slice_mut(&mut self.data) }
 }
 
 // =============================================================================
