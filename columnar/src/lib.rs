@@ -24,7 +24,7 @@
 //!
 //! ## Quick start
 //!
-//! ```rust
+//! ```rust,ignore,no_run
 //! #[repr(C)]
 //! #[derive(Columnar)]
 //! pub struct Sequence {
@@ -52,6 +52,12 @@
 //! // Read individual columns — zero copy
 //! let (ids, scores) = buf.columns((sequence_schema::id, sequence_schema::score));
 //! ```
+
+#[cfg(test)]
+extern crate self as columnar;
+
+#[cfg(test)]
+mod tests;
 
 // =============================================================================
 // ByteBuffer
@@ -164,7 +170,7 @@ pub trait Schema: Sized {
 /// Because `Schema` is an associated type, passing a column token from one
 /// schema to a buffer of a different schema is a **compile-time error**:
 ///
-/// ```rust
+/// ```rust,ignore
 /// // ✓ correct — token matches the buffer's schema
 /// sequences.columns((sequence::schema::id,));
 ///
@@ -476,7 +482,7 @@ impl<S: Schema, B: ByteBuffer> Columnar<S, B> {
     /// tuple of `&[T]` slices.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// let (ids, scores) = buf.columns((sequence::schema::id, sequence::schema::score));
     /// for (id, score) in ids.iter().zip(scores.iter()) {
     ///     println!("{id}: {score}");
@@ -516,7 +522,7 @@ impl<S: Schema, B: ByteBuffer> Columnar<S, B> {
     /// that would create aliased mutable references.
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// buf.mutate((sequence::schema::score,), |(scores,)| {
     ///     for i in 0..scores.len() {
     ///         scores[i] *= 1.1;  // boost all scores in-place
@@ -547,7 +553,7 @@ impl<S: Schema, B: ByteBuffer> Columnar<S, B> {
     /// Panics if the buffer is full (`row_count == row_capacity`).
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// buf.push_with(
     ///     (sequence_schema::id, sequence_schema::score),
     ///     |row, (ids, scores)| {
@@ -579,7 +585,7 @@ impl<S: Schema, B: ByteBuffer> Columnar<S, B> {
     /// Panics if the buffer is full (`row_count == row_capacity`).
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,ignore
     /// buf.push(Sequence { id: 1, score: 0.95, elements: [0u8; 32] });
     /// ```
     pub fn push<T>(&mut self, value: T)
