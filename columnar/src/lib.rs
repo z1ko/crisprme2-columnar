@@ -34,7 +34,7 @@
 //! }
 //!
 //! // Allocate a buffer for 1024 rows
-//! let mut buf: Columnar<SequenceSchema, RingSlot> =
+//! let mut buf: ColumnarBuffer<SequenceSchema, RingSlot> =
 //!     RingSlot::new(1024 * SequenceSchema::STRIDE).columnar();
 //!
 //! // Push a full row at once
@@ -59,11 +59,19 @@ extern crate self as columnar;
 #[cfg(test)]
 mod tests;
 
+pub mod macros {
+    pub use columnar_derive::*;
+}
+
+/// Extensions
+pub mod ext;
+
 // =============================================================================
 // ByteBuffer
 // =============================================================================
 
-/// Trait for types that can serve as the raw byte backing store of a [`Columnar`] buffer.
+/// Trait for types that can serve as the raw byte backing store of a [`ColumnarBuffer`]
+/// buffer.
 ///
 /// Implement this for any contiguous, byte-addressable allocation you want to use
 /// as columnar storage — a plain heap `Vec<u8>`, a GPU-pinned allocation, a
@@ -73,7 +81,7 @@ mod tests;
 ///
 /// The byte slice returned by `as_bytes` and `as_bytes_mut` must be the **same**
 /// contiguous region on every call, with a length that does not change after the
-/// buffer is handed to [`Columnar::new`].
+/// buffer is handed to [`ColumnarBuffer::new`].
 pub trait ByteBuffer {
     /// Return a shared view of the raw storage.
     fn as_bytes(&self) -> &[u8];
@@ -92,7 +100,7 @@ impl ByteBuffer for Vec<u8> {
 // =============================================================================
 
 /// A plain heap-allocated byte slab intended to be used as a slot in a ring
-/// buffer pool, but usable as a standalone backing store for [`Columnar`].
+/// buffer pool, but usable as a standalone backing store for [`ColumnarBuffer`].
 ///
 /// The backing allocation is `Vec<u64>` (8-byte aligned) so that all standard
 /// primitive column types are naturally aligned regardless of `row_capacity`.
@@ -108,8 +116,8 @@ impl RingSlot {
     }
 
     /// Wrap this slot in a typed columnar buffer. Takes ownership of `self`.
-    pub fn columnar<S: Schema>(self) -> Columnar<S, RingSlot> {
-        Columnar::new(self)
+    pub fn columnar<S: Schema>(self) -> ColumnarBuffer<S, RingSlot> {
+        ColumnarBuffer::new(self)
     }
 }
 
@@ -373,10 +381,10 @@ pub trait Columns<'buffer, S: Schema, B: ByteBuffer> {
     /// Panics if any two requested columns refer to the same byte range
     /// (i.e. duplicate column tokens), as this would create aliased mutable
     /// references.
-    fn get_mut(self, buf: &'buffer mut Columnar<S, B>) -> Self::OutputMut;
+    fn get_mut(self, buf: &'buffer mut ColumnarBuffer<S, B>) -> Self::OutputMut;
 
     /// Borrow multiple columns immutably from `buf`.
-    fn get(self, buf: &'buffer Columnar<S, B>) -> Self::Output;
+    fn get(self, buf: &'buffer ColumnarBuffer<S, B>) -> Self::Output;
 }
 
 macro_rules! impl_columns {
@@ -390,7 +398,7 @@ macro_rules! impl_columns {
             type OutputMut = ( $( $C::Mut<'buffer>, )+ );
             type Output    = ( $( $C::Ref<'buffer>, )+ );
 
-            fn get_mut(self, buf: &'buffer mut Columnar<S, B>) -> Self::OutputMut {
+            fn get_mut(self, buf: &'buffer mut ColumnarBuffer<S, B>) -> Self::OutputMut {
                 // Collect all col_indices for duplicate detection.
                 let mut all_indices: Vec<usize> = Vec::new();
                 $( self.$idx.collect_col_indices(&mut all_indices); )+
@@ -411,7 +419,7 @@ macro_rules! impl_columns {
                 // SAFETY: col_indices are guaranteed non-overlapping by the check above.
                 // Each selector constructs slices over distinct, non-overlapping byte
                 // ranges, so no aliasing occurs.
-                let data = buf.buffer.as_bytes_mut().as_mut_ptr();
+                let data = buf.storage.as_bytes_mut().as_mut_ptr();
                 let row_count = buf.row_count;
                 let row_capacity = buf.row_capacity;
                 unsafe {
@@ -421,8 +429,8 @@ macro_rules! impl_columns {
                 }
             }
 
-            fn get(self, buf: &'buffer Columnar<S, B>) -> Self::Output {
-                let data = buf.buffer.as_bytes();
+            fn get(self, buf: &'buffer ColumnarBuffer<S, B>) -> Self::Output {
+                let data = buf.storage.as_bytes();
                 let row_count = buf.row_count;
                 let row_capacity = buf.row_capacity;
                 ($(
@@ -469,13 +477,13 @@ impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4), (5, C5), (6, C6), (7,
 ///
 /// Column accessors (`columns`, `mutate`) return slices of length `row_count`,
 /// not `row_capacity`, so unwritten rows are never exposed.
-pub struct Columnar<S: Schema, B: ByteBuffer> {
+pub struct ColumnarBuffer<S: Schema, B: ByteBuffer> {
 
     /// Phantom marker tying this buffer to its schema type.
     _schema: std::marker::PhantomData<S>,
 
     /// The underlying raw byte storage.
-    pub buffer: B,
+    pub storage: B,
 
     /// Maximum number of rows this buffer can hold.
     row_capacity: usize,
@@ -484,7 +492,7 @@ pub struct Columnar<S: Schema, B: ByteBuffer> {
     row_count: usize,
 }
 
-impl<S: Schema, B: ByteBuffer> Columnar<S, B> {
+impl<S: Schema, B: ByteBuffer> ColumnarBuffer<S, B> {
 
     /// Create a new columnar buffer wrapping `buffer`.
     ///
@@ -495,7 +503,7 @@ impl<S: Schema, B: ByteBuffer> Columnar<S, B> {
         Self {
             _schema: std::marker::PhantomData,
             row_capacity,
-            buffer,
+            storage: buffer,
             row_count: 0,
         }
     }
@@ -508,7 +516,7 @@ impl<S: Schema, B: ByteBuffer> Columnar<S, B> {
     /// Useful for returning the slot to a pool or passing raw bytes to an
     /// external system (e.g. a network writer or memory-mapped file).
     pub fn detach(self) -> B {
-        self.buffer
+        self.storage
     }
 
     // ── Metadata ──────────────────────────────────────────────────────────────
@@ -578,7 +586,7 @@ impl<S: Schema, B: ByteBuffer> Columnar<S, B> {
         T: SoARead<Schema = S>
     {
         if row >= self.row_count { return None; }
-        Some(T::read_from(self.buffer.as_bytes(), row, self.row_capacity))
+        Some(T::read_from(self.storage.as_bytes(), row, self.row_capacity))
     }
 
     // ── Write access ──────────────────────────────────────────────────────────
@@ -667,7 +675,7 @@ impl<S: Schema, B: ByteBuffer> Columnar<S, B> {
         T: SoAWrite<Schema = S>
     {
         assert!(!self.is_full(), "Columnar: buffer full");
-        value.write_into(self.buffer.as_bytes_mut(), self.row_count, self.row_capacity);
+        value.write_into(self.storage.as_bytes_mut(), self.row_count, self.row_capacity);
         self.row_count += 1;
     }
 }

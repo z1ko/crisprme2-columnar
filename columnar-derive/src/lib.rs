@@ -26,6 +26,7 @@ struct FieldInfo<'a> {
 
 fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
+    /*
     // #[repr(C)] must be present for bytemuck
     let has_repr_c = input.attrs.iter().any(|attr| {
         attr.path().is_ident("repr") &&
@@ -38,6 +39,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             "Columnar requires #[repr(C)] to guarantee stable field offsets",
         ));
     }
+     */
 
     // Get all fields of the struct
     let fields = match &input.data {

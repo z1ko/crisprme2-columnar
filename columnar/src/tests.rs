@@ -2,11 +2,10 @@
 // surrounding module, so multiple derived structs must live in separate modules
 // to avoid the name conflict.
 
-use crate::{ByteBuffer, Columnar, RingSlot, Schema};
+use crate::{ByteBuffer, ColumnarBuffer, RingSlot, Schema, macros::Columnar};
 
 mod point {
     use super::*;
-    use columnar_derive::Columnar;
 
     #[repr(C)]
     #[derive(Debug, Clone, PartialEq, Columnar)]
@@ -18,7 +17,6 @@ mod point {
 
 mod record {
     use super::*;
-    use columnar_derive::Columnar;
     #[repr(C)]
     #[derive(Debug, Clone, PartialEq, Columnar)]
     pub struct Record {
@@ -30,7 +28,6 @@ mod record {
 
 mod single {
     use super::*;
-    use columnar_derive::Columnar;
     #[repr(C)]
     #[derive(Debug, Clone, PartialEq, Columnar)]
     pub struct Single {
@@ -40,7 +37,6 @@ mod single {
 
 mod wide {
     use super::*;
-    use columnar_derive::Columnar;
     #[repr(C)]
     #[derive(Debug, Clone, PartialEq, Columnar)]
     pub struct Wide {
@@ -53,7 +49,6 @@ mod wide {
 // Expected block order: b first (align 4), then a and c (align 1, stable)
 mod scrambled {
     use super::*;
-    use columnar_derive::Columnar;
     #[repr(C)]
     #[derive(Debug, Clone, PartialEq, Columnar)]
     pub struct Scrambled {
@@ -69,11 +64,11 @@ use single::{Single, SingleSchema, schema as ss};
 use wide::{Wide, WideSchema, schema as ws};
 use scrambled::{Scrambled, ScrambledSchema, schema as scr};
 
-fn point_buf(rows: usize) -> Columnar<PointSchema, RingSlot> {
+fn point_buf(rows: usize) -> ColumnarBuffer<PointSchema, RingSlot> {
     RingSlot::new(rows * PointSchema::stride()).columnar()
 }
 
-fn record_buf(rows: usize) -> Columnar<RecordSchema, RingSlot> {
+fn record_buf(rows: usize) -> ColumnarBuffer<RecordSchema, RingSlot> {
     RingSlot::new(rows * RecordSchema::stride()).columnar()
 }
 
@@ -132,7 +127,7 @@ fn new_capacity_from_byte_len() {
 #[test]
 fn new_vec_backing() {
     let raw = vec![0u8; 10 * PointSchema::STRIDE];
-    let buf: Columnar<PointSchema, Vec<u8>> = Columnar::new(raw);
+    let buf: ColumnarBuffer<PointSchema, Vec<u8>> = ColumnarBuffer::new(raw);
     assert_eq!(buf.capacity(), 10);
 }
 
@@ -408,7 +403,7 @@ fn soa_layout_two_columns_are_contiguous() {
     for i in 0..4u32 {
         buf.push(Point { x: i as f32, y: (i * 10) as f32 });
     }
-    let raw = buf.buffer.as_bytes();
+    let raw = buf.storage.as_bytes();
     let xs: &[f32] = bytemuck::cast_slice(&raw[0..16]);
     let ys: &[f32] = bytemuck::cast_slice(&raw[16..32]);
     assert_eq!(xs, &[0.0f32, 1.0, 2.0, 3.0]);
@@ -425,7 +420,7 @@ fn soa_layout_three_columns() {
     buf.push(Record { id: 10, score: 0.1, tag: [1, 2, 3, 4] });
     buf.push(Record { id: 20, score: 0.2, tag: [5, 6, 7, 8] });
 
-    let raw = buf.buffer.as_bytes();
+    let raw = buf.storage.as_bytes();
     let ids:    &[u32]    = bytemuck::cast_slice(&raw[0..8]);
     let scores: &[f32]    = bytemuck::cast_slice(&raw[8..16]);
     let tags:   &[[u8;4]] = bytemuck::cast_slice(&raw[16..24]);
@@ -477,8 +472,8 @@ fn detach_and_rewrap_preserves_bytes() {
 
     let slot: RingSlot = buf.detach();
     // Rewrap — row_count resets, but bytes are intact
-    let buf2: Columnar<PointSchema, _> = Columnar::new(slot);
-    let xs: &[f32] = bytemuck::cast_slice(&buf2.buffer.as_bytes()[0..16]);
+    let buf2: ColumnarBuffer<PointSchema, _> = ColumnarBuffer::new(slot);
+    let xs: &[f32] = bytemuck::cast_slice(&buf2.storage.as_bytes()[0..16]);
     assert_eq!(xs[0], 1.0);
 }
 
@@ -489,7 +484,7 @@ fn detach_and_rewrap_preserves_bytes() {
 #[test]
 fn vec_backing_push_and_get() {
     let raw = vec![0u8; 8 * PointSchema::STRIDE];
-    let mut buf: Columnar<PointSchema, Vec<u8>> = Columnar::new(raw);
+    let mut buf: ColumnarBuffer<PointSchema, Vec<u8>> = ColumnarBuffer::new(raw);
     buf.push(Point { x: 7.0, y: -7.0 });
     assert_eq!(buf.get::<Point>(0).unwrap(), Point { x: 7.0, y: -7.0 });
 }
@@ -497,7 +492,7 @@ fn vec_backing_push_and_get() {
 #[test]
 fn vec_backing_columns_correct() {
     let raw = vec![0u8; 4 * PointSchema::STRIDE];
-    let mut buf: Columnar<PointSchema, Vec<u8>> = Columnar::new(raw);
+    let mut buf: ColumnarBuffer<PointSchema, Vec<u8>> = ColumnarBuffer::new(raw);
     for i in 0..4u32 { buf.push(Point { x: i as f32, y: 0.0 }); }
     let (xs,) = buf.columns((ps::x,));
     assert_eq!(xs, &[0.0f32, 1.0, 2.0, 3.0]);
@@ -510,7 +505,7 @@ fn vec_backing_columns_correct() {
 #[test]
 fn push_order_preserved_in_columns() {
     let raw = vec![0u8; 5 * SingleSchema::STRIDE];
-    let mut buf: Columnar<SingleSchema, Vec<u8>> = Columnar::new(raw);
+    let mut buf: ColumnarBuffer<SingleSchema, Vec<u8>> = ColumnarBuffer::new(raw);
     for v in [10u64, 20, 30, 40, 50] { buf.push(Single { value: v }); }
     let (vals,) = buf.columns((ss::value,));
     assert_eq!(vals, &[10u64, 20, 30, 40, 50]);
@@ -523,7 +518,7 @@ fn push_order_preserved_in_columns() {
 #[test]
 fn eight_columns_access() {
     let raw = vec![0u8; WideSchema::STRIDE];
-    let mut buf: Columnar<WideSchema, Vec<u8>> = Columnar::new(raw);
+    let mut buf: ColumnarBuffer<WideSchema, Vec<u8>> = ColumnarBuffer::new(raw);
     buf.push(Wide { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8 });
 
     let (a, b, c, d, e, f, g, h) = buf.columns((
@@ -605,14 +600,14 @@ fn scrambled_raw_layout() {
     // block 1 (a): bytes 16..20 = [a0, a1, a2, a3] (4 * 1)
     // block 2 (c): bytes 20..24 = [c0, c1, c2, c3] (4 * 1)
     let rows = 4usize;
-    let mut buf: Columnar<ScrambledSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<ScrambledSchema, RingSlot> =
         RingSlot::new(rows * ScrambledSchema::STRIDE).columnar();
     buf.push(Scrambled { a: 10, b: 100, c: 200 });
     buf.push(Scrambled { a: 11, b: 101, c: 201 });
     buf.push(Scrambled { a: 12, b: 102, c: 202 });
     buf.push(Scrambled { a: 13, b: 103, c: 203 });
 
-    let raw = buf.buffer.as_bytes();
+    let raw = buf.storage.as_bytes();
     let bs: &[u32] = bytemuck::cast_slice(&raw[0..16]);
     let a_block = &raw[16..20];
     let c_block = &raw[20..24];
@@ -623,7 +618,7 @@ fn scrambled_raw_layout() {
 
 #[test]
 fn scrambled_push_get_round_trip() {
-    let mut buf: Columnar<ScrambledSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<ScrambledSchema, RingSlot> =
         RingSlot::new(4 * ScrambledSchema::STRIDE).columnar();
     let rows = [
         Scrambled { a: 1, b: 1000, c: 100 },
@@ -638,7 +633,7 @@ fn scrambled_push_get_round_trip() {
 
 #[test]
 fn scrambled_columns_access() {
-    let mut buf: Columnar<ScrambledSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<ScrambledSchema, RingSlot> =
         RingSlot::new(3 * ScrambledSchema::STRIDE).columnar();
     buf.push(Scrambled { a: 7, b: 77, c: 17 });
     buf.push(Scrambled { a: 8, b: 88, c: 18 });
@@ -656,11 +651,9 @@ fn scrambled_columns_access() {
 
 mod grouped {
     use super::*;
-    use columnar_derive::Columnar;
 
-    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
     #[repr(C)]
-    #[derive(Columnar)]
+    #[derive(Debug, Clone, PartialEq, Columnar)]
     pub struct Grouped {
         pub id: u32,
         #[columnar(group)]
@@ -673,7 +666,7 @@ use grouped::schema as gs;
 
 #[test]
 fn group_push_get_round_trip() {
-    let mut buf: Columnar<GroupedSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
         RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
@@ -689,7 +682,7 @@ fn group_push_get_round_trip() {
 
 #[test]
 fn group_columns_access() {
-    let mut buf: Columnar<GroupedSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
         RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
@@ -708,7 +701,7 @@ fn group_columns_access() {
 
 #[test]
 fn group_mixed_columns_access() {
-    let mut buf: Columnar<GroupedSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
         RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
@@ -723,7 +716,7 @@ fn group_mixed_columns_access() {
 
 #[test]
 fn group_mutate() {
-    let mut buf: Columnar<GroupedSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
         RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
@@ -741,7 +734,7 @@ fn group_mutate() {
 
 #[test]
 fn group_mutate_mixed() {
-    let mut buf: Columnar<GroupedSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
         RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
 
@@ -758,7 +751,7 @@ fn group_mutate_mixed() {
 #[test]
 fn group_raw_layout() {
     // Verify that sub-columns are stored transposed in memory
-    let mut buf: Columnar<GroupedSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
         RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
@@ -795,7 +788,7 @@ fn group_schema_total_blocks() {
 #[test]
 #[should_panic(expected = "duplicate columns")]
 fn group_duplicate_panics() {
-    let mut buf: Columnar<GroupedSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
         RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.mutate((gs::elements, gs::elements), |_| {});
@@ -803,7 +796,7 @@ fn group_duplicate_panics() {
 
 #[test]
 fn group_push_with() {
-    let mut buf: Columnar<GroupedSchema, RingSlot> =
+    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
         RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push_with((gs::id, gs::elements), |row, (ids, mut elems)| {
         ids[row] = 42;
@@ -820,7 +813,7 @@ fn group_push_with() {
 
 #[test]
 fn group_empty_columns() {
-    let buf: Columnar<GroupedSchema, RingSlot> =
+    let buf: ColumnarBuffer<GroupedSchema, RingSlot> =
         RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
     let (elems,) = buf.columns((gs::elements,));
     assert_eq!(elems[0].len(), 0);
