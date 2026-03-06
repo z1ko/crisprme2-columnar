@@ -649,3 +649,182 @@ fn scrambled_columns_access() {
     assert_eq!(b_col, &[77u32, 88, 99]);
     assert_eq!(c_col, &[17u8,  18, 19]);
 }
+
+// =============================================================================
+// Group columns tests
+// =============================================================================
+
+mod grouped {
+    use super::*;
+    use columnar_derive::Columnar;
+
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    #[repr(C)]
+    #[derive(Columnar)]
+    pub struct Grouped {
+        pub id: u32,
+        #[columnar(group)]
+        pub elements: [u8; 4],
+    }
+}
+
+use grouped::*;
+use grouped::schema as gs;
+
+#[test]
+fn group_push_get_round_trip() {
+    let mut buf: Columnar<GroupedSchema, RingSlot> =
+        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
+    buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
+
+    let row0: Grouped = buf.get(0).unwrap();
+    assert_eq!(row0.id, 1);
+    assert_eq!(row0.elements, [10, 20, 30, 40]);
+
+    let row1: Grouped = buf.get(1).unwrap();
+    assert_eq!(row1.id, 2);
+    assert_eq!(row1.elements, [11, 21, 31, 41]);
+}
+
+#[test]
+fn group_columns_access() {
+    let mut buf: Columnar<GroupedSchema, RingSlot> =
+        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
+    buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
+    buf.push(Grouped { id: 3, elements: [12, 22, 32, 42] });
+
+    let (ids,) = buf.columns((gs::id,));
+    assert_eq!(ids, &[1u32, 2, 3]);
+
+    let (elems,) = buf.columns((gs::elements,));
+    // elems[element_index][row_index]
+    assert_eq!(elems[0], &[10u8, 11, 12]); // all element[0] across rows
+    assert_eq!(elems[1], &[20u8, 21, 22]); // all element[1] across rows
+    assert_eq!(elems[2], &[30u8, 31, 32]); // all element[2] across rows
+    assert_eq!(elems[3], &[40u8, 41, 42]); // all element[3] across rows
+}
+
+#[test]
+fn group_mixed_columns_access() {
+    let mut buf: Columnar<GroupedSchema, RingSlot> =
+        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
+    buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
+
+    let (ids, elems) = buf.columns((gs::id, gs::elements));
+    assert_eq!(ids, &[1u32, 2]);
+    assert_eq!(elems[0], &[10u8, 11]);
+    assert_eq!(elems[1], &[20u8, 21]);
+    assert_eq!(elems[2], &[30u8, 31]);
+    assert_eq!(elems[3], &[40u8, 41]);
+}
+
+#[test]
+fn group_mutate() {
+    let mut buf: Columnar<GroupedSchema, RingSlot> =
+        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
+    buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
+
+    buf.mutate((gs::elements,), |(elems,)| {
+        // Double all element[0] values
+        for v in elems[0].iter_mut() { *v *= 2; }
+    });
+
+    let row0: Grouped = buf.get(0).unwrap();
+    assert_eq!(row0.elements, [20, 20, 30, 40]);
+    let row1: Grouped = buf.get(1).unwrap();
+    assert_eq!(row1.elements, [22, 21, 31, 41]);
+}
+
+#[test]
+fn group_mutate_mixed() {
+    let mut buf: Columnar<GroupedSchema, RingSlot> =
+        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
+
+    buf.mutate((gs::id, gs::elements), |(ids, mut elems)| {
+        ids[0] = 99;
+        elems[2][0] = 77;
+    });
+
+    let row0: Grouped = buf.get(0).unwrap();
+    assert_eq!(row0.id, 99);
+    assert_eq!(row0.elements, [10, 20, 77, 40]);
+}
+
+#[test]
+fn group_raw_layout() {
+    // Verify that sub-columns are stored transposed in memory
+    let mut buf: Columnar<GroupedSchema, RingSlot> =
+        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
+    buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
+    buf.push(Grouped { id: 3, elements: [12, 22, 32, 42] });
+    buf.push(Grouped { id: 4, elements: [13, 23, 33, 43] });
+
+    let (elems,) = buf.columns((gs::elements,));
+    let ptr0 = elems[0].as_ptr();
+
+    assert_eq!(elems[0], &[10, 11, 12, 13]);
+    assert_eq!(elems[1], &[20, 21, 22, 23]);
+    assert_eq!(elems[2], &[30, 31, 32, 33]);
+    assert_eq!(elems[3], &[40, 41, 42, 43]);
+
+    // Verify contiguity within each sub-column
+    assert_eq!(unsafe { *ptr0.add(0) }, 10);
+    assert_eq!(unsafe { *ptr0.add(1) }, 11);
+    assert_eq!(unsafe { *ptr0.add(2) }, 12);
+    assert_eq!(unsafe { *ptr0.add(3) }, 13);
+}
+
+#[test]
+fn group_schema_stride() {
+    // id: u32 (4 bytes) + elements: [u8; 4] (4 bytes) = 8 bytes stride
+    assert_eq!(GroupedSchema::STRIDE, 8);
+}
+
+#[test]
+fn group_schema_total_blocks() {
+    // id: 1 block + elements: 4 blocks = 5 total
+    assert_eq!(GroupedSchema::TOTAL_BLOCKS, 5);
+}
+
+#[test]
+#[should_panic(expected = "duplicate columns")]
+fn group_duplicate_panics() {
+    let mut buf: Columnar<GroupedSchema, RingSlot> =
+        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
+    buf.mutate((gs::elements, gs::elements), |_| {});
+}
+
+#[test]
+fn group_push_with() {
+    let mut buf: Columnar<GroupedSchema, RingSlot> =
+        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    buf.push_with((gs::id, gs::elements), |row, (ids, mut elems)| {
+        ids[row] = 42;
+        elems[0][row] = 10;
+        elems[1][row] = 20;
+        elems[2][row] = 30;
+        elems[3][row] = 40;
+    });
+
+    let row0: Grouped = buf.get(0).unwrap();
+    assert_eq!(row0.id, 42);
+    assert_eq!(row0.elements, [10, 20, 30, 40]);
+}
+
+#[test]
+fn group_empty_columns() {
+    let buf: Columnar<GroupedSchema, RingSlot> =
+        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let (elems,) = buf.columns((gs::elements,));
+    assert_eq!(elems[0].len(), 0);
+    assert_eq!(elems[1].len(), 0);
+    assert_eq!(elems[2].len(), 0);
+    assert_eq!(elems[3].len(), 0);
+}

@@ -205,6 +205,82 @@ pub trait ColumnType: Copy {
 }
 
 // =============================================================================
+// GroupColumnType
+// =============================================================================
+
+/// A zero-sized type (ZST) token representing a group of N typed sub-columns
+/// within a [`Schema`], produced by expanding a `[T; N]` array field annotated
+/// with `#[columnar(group)]`.
+///
+/// Instead of storing `[T; N]` as a single contiguous column, a group column
+/// stores each array element as a separate column. This means all rows'
+/// `element[k]` values are contiguous in memory — ideal for GPU/CUDA coalesced
+/// access patterns.
+///
+/// # Type safety
+///
+/// Like [`ColumnType`], the `Schema` associated type prevents mixing tokens
+/// from different schemas at compile time.
+pub trait GroupColumnType<const N: usize>: Copy {
+    /// The schema this group column belongs to.
+    type Schema: Schema;
+
+    /// The element type stored in each sub-column.
+    type Value: bytemuck::Pod;
+
+    /// Returns the col_index of the k-th sub-column (0 <= k < N).
+    fn col_index(self, k: usize) -> usize;
+
+    /// Byte offset of the k-th sub-column's block.
+    fn offset(self, k: usize, row_capacity: usize) -> usize;
+
+    /// Size in bytes of a single element in each sub-column.
+    fn elem_size(self) -> usize {
+        std::mem::size_of::<Self::Value>()
+    }
+}
+
+// =============================================================================
+// ColumnSelector
+// =============================================================================
+
+/// Unified column access trait that abstracts over both single columns
+/// ([`ColumnType`]) and group columns ([`GroupColumnType`]).
+///
+/// This trait is implemented by the `#[derive(Columnar)]` macro for each
+/// generated column ZST. The [`Columns`] trait uses it as a bound, enabling
+/// mixed tuples of regular and group columns.
+pub trait ColumnSelector: Copy {
+    /// The schema this selector belongs to.
+    type Schema: Schema;
+
+    /// Shared slice(s) returned for read access.
+    /// - For a regular column: `&'a [T]`
+    /// - For a group column `[T; N]`: `[&'a [T]; N]`
+    type Ref<'a>;
+
+    /// Mutable slice(s) returned for write access.
+    /// - For a regular column: `&'a mut [T]`
+    /// - For a group column `[T; N]`: `[&'a mut [T]; N]`
+    type Mut<'a>;
+
+    /// Append all col_indices occupied by this selector to `out`.
+    /// Used for duplicate detection in mutable access.
+    fn collect_col_indices(&self, out: &mut Vec<usize>);
+
+    /// Extract shared typed slice(s) from raw buffer bytes.
+    fn get_ref<'a>(self, data: &'a [u8], row_count: usize, row_capacity: usize) -> Self::Ref<'a>;
+
+    /// Extract mutable typed slice(s) from a raw buffer pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the byte ranges covered by this selector
+    /// do not overlap with any other concurrently borrowed ranges.
+    unsafe fn get_mut<'a>(self, data: *mut u8, row_count: usize, row_capacity: usize) -> Self::Mut<'a>;
+}
+
+// =============================================================================
 // SoAWrite
 // =============================================================================
 
@@ -262,7 +338,7 @@ pub trait SoARead {
 /// in a single call, with compile-time type safety and runtime non-overlap
 /// checking for mutable access.
 ///
-/// Implemented for tuples of [`ColumnType`] values up to arity 8 via the
+/// Implemented for tuples of [`ColumnSelector`] values up to arity 8 via the
 /// [`impl_columns!`] macro. You never implement this trait manually.
 ///
 /// # Output types
@@ -307,25 +383,24 @@ macro_rules! impl_columns {
     ( $( ($idx:tt, $C:ident) ),+ ) => {
         impl<'buffer, S, B, $($C),+> Columns<'buffer, S, B> for ($($C,)+)
         where
-            $( $C: ColumnType<Schema = S>, )+
+            $( $C: ColumnSelector<Schema = S>, )+
             S: Schema,
             B: ByteBuffer,
         {
-            type OutputMut = ( $( &'buffer mut [$C::Value], )+ );
-            type Output    = ( $( &'buffer     [$C::Value], )+ );
+            type OutputMut = ( $( $C::Mut<'buffer>, )+ );
+            type Output    = ( $( $C::Ref<'buffer>, )+ );
 
             fn get_mut(self, buf: &'buffer mut Columnar<S, B>) -> Self::OutputMut {
-                let ranges: &[std::ops::Range<usize>] = &[
-                    $( buf.column_content_range(&self.$idx), )+
-                ];
+                // Collect all col_indices for duplicate detection.
+                let mut all_indices: Vec<usize> = Vec::new();
+                $( self.$idx.collect_col_indices(&mut all_indices); )+
 
                 // Panic on duplicate columns — would produce aliased &mut refs (UB).
-                // O(n²) over the tuple arity, which is at most 8 — negligible cost.
                 let mut i = 0;
-                while i < ranges.len() {
+                while i < all_indices.len() {
                     let mut j = i + 1;
-                    while j < ranges.len() {
-                        if ranges[i] == ranges[j] {
+                    while j < all_indices.len() {
+                        if all_indices[i] == all_indices[j] {
                             panic!("duplicate columns requested, would alias mutable references");
                         }
                         j += 1;
@@ -333,29 +408,25 @@ macro_rules! impl_columns {
                     i += 1;
                 }
 
-                // SAFETY: ranges are guaranteed non-overlapping by the check above.
-                // We obtain a raw pointer to the allocation and construct independent
-                // sub-slices from it. Each sub-slice covers a distinct, non-overlapping
-                // byte range, so no aliasing occurs.
+                // SAFETY: col_indices are guaranteed non-overlapping by the check above.
+                // Each selector constructs slices over distinct, non-overlapping byte
+                // ranges, so no aliasing occurs.
                 let data = buf.buffer.as_bytes_mut().as_mut_ptr();
-                ($(
-                    bytemuck::cast_slice_mut(unsafe {
-                        std::slice::from_raw_parts_mut(
-                            data.add(ranges[$idx].start),
-                            ranges[$idx].len(),
-                        )
-                    }),
-                )+)
+                let row_count = buf.row_count;
+                let row_capacity = buf.row_capacity;
+                unsafe {
+                    ($(
+                        self.$idx.get_mut(data, row_count, row_capacity),
+                    )+)
+                }
             }
 
             fn get(self, buf: &'buffer Columnar<S, B>) -> Self::Output {
-                let ranges: &[std::ops::Range<usize>] = &[
-                    $( buf.column_content_range(&self.$idx), )+
-                ];
+                let data = buf.buffer.as_bytes();
+                let row_count = buf.row_count;
+                let row_capacity = buf.row_capacity;
                 ($(
-                    bytemuck::cast_slice(
-                        &buf.buffer.as_bytes()[ranges[$idx].clone()]
-                    ),
+                    self.$idx.get_ref(data, row_count, row_capacity),
                 )+)
             }
         }
