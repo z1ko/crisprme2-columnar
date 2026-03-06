@@ -1,4 +1,4 @@
-use columnar::{RingSlot, Schema};
+use columnar::RingSlot;
 use columnar_derive::Columnar;
 
 mod sequence;
