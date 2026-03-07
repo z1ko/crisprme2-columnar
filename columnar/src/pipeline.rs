@@ -27,10 +27,17 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn new(pool: Arc<Pool>) -> Self {
+
+    pub fn new(pool_slots: usize, slot_bytes: usize) -> Self {
+        Self::new_with_pool(
+            Arc::new(
+                Pool::new(pool_slots, slot_bytes)))
+    }
+
+    pub fn new_with_pool(pool: Arc<Pool>) -> Self {
         Self {
-            pool,
             handles: vec![],
+            pool,
         }
     }
 
@@ -104,7 +111,7 @@ mod test {
         let (mid_tx, mid_rx) = connector::<data::RecordSchema, ()>(2);
         let (out_tx, out_rx) = connector::<data::RecordSchema, ()>(2);
 
-        let mut pipeline = Pipeline::new(pool.clone());
+        let mut pipeline = Pipeline::new_with_pool(pool.clone());
 
         // Stage A: multiply values by 2
         let mid_tx_clone = mid_tx.clone();
@@ -124,7 +131,7 @@ mod test {
 
         // Stage B: add 1
         let out_tx_clone = out_tx.clone();
-        pipeline.stage("add-one", mid_rx, 1, move |chunk, ctx| {
+        pipeline.stage("add-one", mid_rx, 2, move |chunk, ctx| {
             let mut writer = ctx.pool().acquire::<data::RecordSchema>().unwrap();
             writer.buffer_mut().mutate(
                 (data::schema::value,),
