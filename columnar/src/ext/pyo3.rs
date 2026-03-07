@@ -36,7 +36,7 @@ use std::os::raw::c_int;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use crate::{ByteBuffer, ColumnType, ColumnarBuffer, GroupColumnType, Schema};
+use crate::buffer::{ByteBuffer, ColumnType, ColumnarBuffer, GroupColumnType, Schema};
 
 // =============================================================================
 // PyBufferFormat

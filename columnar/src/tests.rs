@@ -2,7 +2,8 @@
 // surrounding module, so multiple derived structs must live in separate modules
 // to avoid the name conflict.
 
-use crate::{ByteBuffer, ColumnarBuffer, RingSlot, Schema, macros::Columnar};
+use crate::buffer::{ByteBuffer, ColumnarBuffer, RingSlot, Schema};
+use crate::macros::Columnar;
 
 mod point {
     use super::*;

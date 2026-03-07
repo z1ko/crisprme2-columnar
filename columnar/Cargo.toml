@@ -10,6 +10,7 @@ pyo3 = [ "dep:pyo3" ]
 columnar-derive = { path = "../columnar-derive" }
 bytemuck = { version = "1.25.0", features = ["derive"] }
 pyo3 = { version = "0.28.2", optional = true }
+crossbeam = "0.8.4"
 
 # Re-export the derive macro
 [package.metadata]
