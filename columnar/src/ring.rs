@@ -1,4 +1,4 @@
-use std::{ops::Deref, sync::Arc, time::Duration};
+use std::{ops::Deref, sync::Arc, time::{Duration, Instant}};
 
 use crossbeam::channel::{Receiver, RecvError, RecvTimeoutError, SendError, Sender, bounded};
 
@@ -35,7 +35,8 @@ impl Pool {
         Ok(WriteChunk {
             lease: PoolSlotLease { 
                 buffer: Some(buffer), 
-                ret: self.free_tx.clone() 
+                ret: self.free_tx.clone(),
+                received_at: Instant::now()
             }
         })
     }
@@ -43,11 +44,13 @@ impl Pool {
 
 pub struct PoolSlotLease<S: Schema> {
     buffer: Option<ColumnarBuffer<S, PoolSlot>>,
-    ret: Sender<PoolSlot>
+    ret: Sender<PoolSlot>,
+    received_at: Instant,
 }
 
 impl<S: Schema> Drop for PoolSlotLease<S> {
     fn drop(&mut self) {
+        println!("Lease released after {} ms", self.received_at.elapsed().as_millis());
         if let Some(buffer) = self.buffer.take() {
             let slot = buffer.detach();
             let _ = self.ret.send(slot);
@@ -113,26 +116,37 @@ impl<S: Schema, M> ReadChunk<S, M> {
     }
 }
 
-pub struct Connector<S: Schema, M> {
-    rx: Receiver<ReadChunk<S, M>>,
-    tx: Sender<ReadChunk<S, M>>
+/// Create a bounded connector channel pair for passing chunks between pipeline stages.
+pub fn connector<S: Schema, M>(cap: usize) -> (ConnectorTx<S, M>, ConnectorRx<S, M>) {
+    let (tx, rx) = bounded(cap);
+    (ConnectorTx(tx), ConnectorRx(rx))
 }
 
-impl<S: Schema, M> Connector<S, M> {
+/// Sending half of a connector. Clone to fan-in from multiple producers.
+/// When all `ConnectorTx` clones are dropped, receivers get `RecvError`.
+pub struct ConnectorTx<S: Schema, M>(Sender<ReadChunk<S, M>>);
 
-    pub fn new(cap: usize) -> Self {
-        let (tx, rx) = bounded(cap);
-        Self { tx, rx }
-    }
+impl<S: Schema, M> Clone for ConnectorTx<S, M> {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
 
-    /// Send a chunk downstream
+impl<S: Schema, M> ConnectorTx<S, M> {
     pub fn send(&self, chunk: ReadChunk<S, M>) -> Result<(), SendError<ReadChunk<S, M>>> {
-        self.tx.send(chunk)
+        self.0.send(chunk)
     }
+}
 
-    /// Receive a chunk from upstream
+/// Receiving half of a connector. Clone to have multiple workers consume from the same channel.
+/// Returns `RecvError` when all senders are dropped.
+pub struct ConnectorRx<S: Schema, M>(Receiver<ReadChunk<S, M>>);
+
+impl<S: Schema, M> Clone for ConnectorRx<S, M> {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
+
+impl<S: Schema, M> ConnectorRx<S, M> {
     pub fn recv(&self) -> Result<ReadChunk<S, M>, RecvError> {
-        self.rx.recv()
+        self.0.recv()
     }
 }
 
@@ -170,8 +184,8 @@ mod test {
 
         let pool = Pool::new(2, 1024);
 
-        let src: Connector<src::InputSchema, ()> = Connector::new(2);
-        let dst: Connector<dst::OutputSchema, OutputMetadata> = Connector::new(1);
+        let (src_tx, src_rx) = connector::<src::InputSchema, ()>(2);
+        let (dst_tx, dst_rx) = connector::<dst::OutputSchema, OutputMetadata>(1);
         {
             let mut writer = pool.acquire::<src::InputSchema>().unwrap();
             writer.buffer_mut().mutate((src::schema::id,), |(ids,)| {
@@ -181,12 +195,12 @@ mod test {
             });
 
             let reader = writer.publish();
-            src.send(reader).unwrap();
+            src_tx.send(reader).unwrap();
         }
         {
-            let input = src.recv().unwrap();
+            let input = src_rx.recv().unwrap();
             let mut output = pool.acquire::<dst::OutputSchema>().unwrap();
-            
+
             output.buffer_mut().mutate((dst::schema::pos,), |(pos,) : (&mut [u32],)| {
                 let (ids,): (&[u32],) = input.columns((src::schema::id,));
                 for (id, p) in ids.iter().zip(pos) {
@@ -195,11 +209,11 @@ mod test {
             });
 
             let result = output.publish_with_metadata(OutputMetadata { source: input });
-            dst.send(result).unwrap();
+            dst_tx.send(result).unwrap();
         }
 
-        let result = dst.recv().unwrap();
-        
+        let result = dst_rx.recv().unwrap();
+
         let metadata = result.metadata();
         let (pos,) = result.columns((dst::schema::pos,));
         let (ids,) = metadata.source.columns((src::schema::id,));

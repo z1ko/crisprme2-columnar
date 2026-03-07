@@ -10,6 +10,7 @@ pub mod macros {
 
 pub mod buffer;
 pub mod ring;
+pub mod pipeline;
 
 /// Extensions
 pub mod ext;
