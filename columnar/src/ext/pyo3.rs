@@ -170,7 +170,7 @@ impl PyColumnView {
 macro_rules! __pybatch_impl {
     ($name:ident, $schema:ty,
      cols: [ $( $method:ident => $col:expr ),* ],
-     groups: [ $( $gmethod:ident [ $gn:literal ] => $gcol:expr ),* ]
+     groups: [ $( $gmethod:ident [ $gn:expr ] => $gcol:expr ),* ]
     ) => {
 
         #[::pyo3::pyclass(str = "{batch:?}")]
@@ -275,7 +275,7 @@ macro_rules! pybatch {
     // With groups
     ($name:ident, $schema:ty,
      { $( $method:ident => $col:expr ),* $(,)? },
-     groups: { $( $gmethod:ident [ $gn:literal ] => $gcol:expr ),* $(,)? }
+     groups: { $( $gmethod:ident [ $gn:expr ] => $gcol:expr ),* $(,)? }
     ) => {
         $crate::__pybatch_impl!($name, $schema,
             cols: [ $( $method => $col ),* ],

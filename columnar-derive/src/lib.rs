@@ -18,6 +18,8 @@ struct FieldInfo<'a> {
     name: &'a Ident,
     ty: &'a syn::Type,
     is_group: bool,
+    /// Skip this field in the pyclass wrapper
+    skip_py: bool,
     /// For group fields: the element type (T in [T; N])
     elem_type: Option<&'a syn::Type>,
     /// For group fields: the array length expression
@@ -25,21 +27,6 @@ struct FieldInfo<'a> {
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
-
-    /*
-    // #[repr(C)] must be present for bytemuck
-    let has_repr_c = input.attrs.iter().any(|attr| {
-        attr.path().is_ident("repr") &&
-        attr.parse_args::<Ident>()
-            .map(|v| v == "C").unwrap_or(false)
-    });
-
-    if !has_repr_c {
-        return Err(syn::Error::new(input.span(),
-            "Columnar requires #[repr(C)] to guarantee stable field offsets",
-        ));
-    }
-     */
 
     // Get all fields of the struct
     let fields = match &input.data {
@@ -61,12 +48,17 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let name = field.ident.as_ref().unwrap();
         let ty = &field.ty;
 
-        let is_group = field.attrs.iter().any(|attr| {
-            attr.path().is_ident("columnar") &&
-            attr.parse_args::<Ident>()
-                .map(|v| v == "group")
-                .unwrap_or(false)
-        });
+        let mut is_group = false;
+        let mut skip_py = false;
+        for attr in &field.attrs {
+            if attr.path().is_ident("columnar") {
+                let _ = attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("group") { is_group = true; }
+                    if meta.path.is_ident("skip_py") { skip_py = true; }
+                    Ok(())
+                });
+            }
+        }
 
         if is_group {
             // Extract T and N from [T; N]
@@ -84,6 +76,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 name,
                 ty,
                 is_group: true,
+                skip_py,
                 elem_type: Some(elem_type),
                 array_len: Some(array_len),
             });
@@ -92,6 +85,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 name,
                 ty,
                 is_group: false,
+                skip_py,
                 elem_type: None,
                 array_len: None,
             });
@@ -99,6 +93,21 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     }
 
     let has_groups = field_infos.iter().any(|f| f.is_group);
+
+    // Parse struct-level #[columnar(pyclass = "Name")] attribute
+    let mut pyclass_name: Option<Ident> = None;
+    for attr in &input.attrs {
+        if attr.path().is_ident("columnar") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("pyclass") {
+                    let value = meta.value()?;
+                    let lit: syn::LitStr = value.parse()?;
+                    pyclass_name = Some(Ident::new(&lit.value(), lit.span()));
+                }
+                Ok(())
+            })?;
+        }
+    }
 
     // Name of the schema struct
     let struct_name = &input.ident;
@@ -108,24 +117,25 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     );
 
     if has_groups {
-        expand_with_groups(struct_name, &schema_name, &field_infos)
+        expand_with_groups(struct_name, &schema_name, &field_infos, pyclass_name.as_ref())
     } else {
-        expand_simple(struct_name, &schema_name, &field_infos)
+        expand_simple(struct_name, &schema_name, &field_infos, pyclass_name.as_ref())
     }
 }
 
 /// Original expansion path for structs with no group fields.
 fn expand_simple(
-    struct_name: &Ident,
-    schema_name: &Ident,
-    field_infos: &[FieldInfo],
+    struct_name: &Ident, schema_name: &Ident, field_infos: &[FieldInfo], pyclass_name: Option<&Ident>
 ) -> syn::Result<proc_macro2::TokenStream> {
+
     let n = field_infos.len();
     let field_types: Vec<&syn::Type> = field_infos.iter().map(|f| f.ty).collect();
     let field_names: Vec<&Ident> = field_infos.iter().map(|f| f.name).collect();
     let col_indices: Vec<proc_macro2::Literal> = (0..n)
         .map(proc_macro2::Literal::usize_suffixed)
         .collect();
+
+    let pyclass_tokens = gen_pyclass_tokens(pyclass_name, schema_name, field_infos);
 
     Ok(quote! {
         pub struct #schema_name;
@@ -286,6 +296,8 @@ fn expand_simple(
                 }
             )*
         }
+
+        #pyclass_tokens
     })
 }
 
@@ -294,6 +306,7 @@ fn expand_with_groups(
     struct_name: &Ident,
     schema_name: &Ident,
     field_infos: &[FieldInfo],
+    pyclass_name: Option<&Ident>,
 ) -> syn::Result<proc_macro2::TokenStream> {
     // Build the expanded block list at codegen time.
     // For each field, emit entries into ELEM_SIZES and FIELD_ALIGNS.
@@ -572,6 +585,8 @@ fn expand_with_groups(
         }
     }
 
+    let pyclass_tokens = gen_pyclass_tokens(pyclass_name, schema_name, field_infos);
+
     Ok(quote! {
         pub struct #schema_name;
         impl #schema_name {
@@ -684,5 +699,38 @@ fn expand_with_groups(
             use super::*;
             #( #schema_entries )*
         }
+
+        #pyclass_tokens
     })
+}
+
+/// Generate the `__pybatch_impl!` invocation if `#[columnar(pyclass = "...")]` is present.
+fn gen_pyclass_tokens(
+    pyclass_name: Option<&Ident>, schema_name: &Ident, field_infos: &[FieldInfo],
+) -> proc_macro2::TokenStream {
+
+    let Some(pyclass_name) = pyclass_name else {
+        return quote! {};
+    };
+
+    let mut col_entries = Vec::new();
+    let mut group_entries = Vec::new();
+
+    for fi in field_infos {
+        if fi.skip_py { continue; }
+        let name = fi.name;
+        if fi.is_group {
+            let array_len = fi.array_len.unwrap();
+            group_entries.push(quote! { #name [ #array_len ] => schema::#name });
+        } else {
+            col_entries.push(quote! { #name => schema::#name });
+        }
+    }
+
+    quote! {
+        ::columnar::__pybatch_impl!(#pyclass_name, #schema_name,
+            cols: [ #( #col_entries ),* ],
+            groups: [ #( #group_entries ),* ]
+        );
+    }
 }
