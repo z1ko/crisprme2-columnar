@@ -4,29 +4,6 @@
 //! column (or sub-column) of a [`Columnar`] buffer to Python as a
 //! `memoryview`-compatible object — no copies involved.
 //!
-//! # Usage
-//!
-//! You write a schema-specific `#[pyclass]` wrapper around your `Columnar`
-//! buffer and expose column accessors that return [`ColumnView`] instances:
-//!
-//! ```rust,ignore
-//! use columnar::pyo3_support::ColumnView;
-//! use pyo3::prelude::*;
-//!
-//! #[pyclass]
-//! struct PyMyBuffer {
-//!     inner: Columnar<MySchema, Vec<u8>>,
-//! }
-//!
-//! #[pymethods]
-//! impl PyMyBuffer {
-//!     fn column_score(slf: Py<Self>, py: Python<'_>) -> PyResult<ColumnView> {
-//!         let this = slf.borrow(py);
-//!         ColumnView::from_column(&this.inner, my_schema::score, slf.into_any(), false)
-//!     }
-//! }
-//! ```
-//!
 //! On the Python side the returned object supports `memoryview()` and can be
 //! wrapped with `numpy.frombuffer()` for zero-copy array access.
 
@@ -36,8 +13,7 @@ use std::os::raw::c_int;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use crate::buffer::{ByteBuffer, ColumnType, ColumnarBuffer, GroupColumnType, Schema};
-use crate::ring::{Batch, PoolSlotLease};
+use crate::buffer::ColumnType;
 
 // =============================================================================
 // PyBufferFormat
@@ -76,7 +52,7 @@ impl_format!(f32, "f");
 impl_format!(f64, "d");
 
 // =============================================================================
-// ColumnView
+// PyColumnView
 // =============================================================================
 
 /// A zero-copy view into a single column of a [`Columnar`] buffer.
@@ -87,19 +63,19 @@ impl_format!(f64, "d");
 ///
 /// # Preventing garbage collection
 ///
-/// `ColumnView` stores a [`PyObject`] reference to the owning Python wrapper
-/// (e.g. your `#[pyclass]` around `Columnar`). As long as the `ColumnView`
+/// `PyColumnView` stores a [`PyObject`] reference to the owning Python wrapper
+/// (e.g. your `#[pyclass]` around `Columnar`). As long as the `PyColumnView`
 /// is alive, Python's GC will not collect the owner, keeping the backing
 /// memory valid.
 ///
 /// # Safety contract
 ///
 /// The caller must ensure that the `Columnar` buffer is not reallocated or
-/// dropped while any `ColumnView` exists. In practice this means the Python
+/// dropped while any `PyColumnView` exists. In practice this means the Python
 /// wrapper should **not** expose `push` or other capacity-changing operations
 /// while column views are outstanding.
 #[pyclass(unsendable)]
-pub struct ColumnView {
+pub struct PyColumnView {
     /// Prevent GC of the parent Python object that owns the Columnar buffer.
     _owner: Py<PyAny>,
     /// Raw pointer to the first element of this column's data.
@@ -119,115 +95,50 @@ pub struct ColumnView {
     strides: [isize; 1],
 }
 
-impl ColumnView {
+impl PyColumnView {
 
-    /// Create a `ColumnView` for a regular (non-group) column.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf`      — the columnar buffer to view into
-    /// * `col`      — the column token (ZST)
-    /// * `owner`    — a `PyObject` referencing the Python wrapper that owns `buf`
-    /// * `writable` — if `true`, Python may write through this view
-    ///
-    /// # Safety (caller obligations)
-    ///
-    /// The `owner` must prevent `buf` from being deallocated or reallocated for
-    /// the entire lifetime of the returned `ColumnView`.
-    pub fn from_column<S, B, C>(
-        buf: &mut ColumnarBuffer<S, B>,
-        col: C,
-        owner: Py<PyAny>,
-        writable: bool,
-    ) -> Self
+    /// Helper to get the PEP 3118 format string for a column token.
+    #[inline]
+    pub fn format_for_column<C: ColumnType>(_col: C) -> &'static CStr
     where
-        S: Schema,
-        B: ByteBuffer,
-        C: ColumnType<Schema = S>,
         C::Value: PyBufferFormat,
     {
-        let offset = col.offset(buf.capacity());
-        let ptr = unsafe { buf.storage.as_bytes_mut().as_mut_ptr().add(offset) };
-        let len = buf.len() as isize;
-        let item_size = col.elem_size() as isize;
-
-        Self {
-            _owner: owner,
-            ptr,
-            len,
-            item_size,
-            format: C::Value::FORMAT,
-            writable,
-            shape: [len],
-            strides: [item_size],
-        }
+        C::Value::FORMAT
     }
 
-    /// Create `N` `ColumnView`s for a group column (one per sub-column).
-    ///
-    /// Returns a `Vec` of length `N`. Each view covers one sub-column.
-    pub fn from_group_column<S, B, G, const N: usize>(
-        buf: &mut ColumnarBuffer<S, B>,
-        col: G,
-        owner: Py<PyAny>,
-        writable: bool,
-        py: Python<'_>,
-    ) -> Vec<Self>
+    /// Helper to get the PEP 3118 format string for a group column token.
+    #[inline]
+    pub fn format_for_group_column<const N: usize, G: crate::buffer::GroupColumnType<N>>(_col: G) -> &'static CStr
     where
-        S: Schema,
-        B: ByteBuffer,
-        G: GroupColumnType<N, Schema = S>,
         G::Value: PyBufferFormat,
     {
-        let len = buf.len() as isize;
-        let item_size = col.elem_size() as isize;
-        let base_ptr = buf.storage.as_bytes_mut().as_mut_ptr();
-
-        (0..N)
-            .map(|k| {
-                let offset = col.offset(k, buf.capacity());
-                let ptr = unsafe { base_ptr.add(offset) };
-                Self {
-                    _owner: owner.clone_ref(py),
-                    ptr,
-                    len,
-                    item_size,
-                    format: G::Value::FORMAT,
-                    writable,
-                    shape: [len],
-                    strides: [item_size],
-                }
-            })
-            .collect()
+        G::Value::FORMAT
     }
 
-    /// Create a `ColumnView` from a `Batch`.
+    /// Create a `ColumnView` from pre-computed raw values.
     ///
-    /// If `writable` is true, the batch must be the sole owner (no clones).
-    pub fn from_batch<S, M, C>(
-        batch: &mut Batch<S, M>,
-        col: C,
-        owner: Py<PyAny>,
+    /// This is the low-level constructor used by the `pybatch!` macro.
+    /// The caller is responsible for computing the correct pointer, length,
+    /// and format from the column token and buffer.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to valid memory for `len * item_size` bytes, and must
+    /// remain valid for the lifetime of `owner`.
+    pub unsafe fn new_raw(
+        ptr: *mut u8,
+        len: isize,
+        item_size: isize,
+        format: &'static CStr,
         writable: bool,
-    ) -> Self
-    where
-        S: Schema,
-        M: 'static,
-        C: ColumnType<Schema = S>,
-        C::Value: PyBufferFormat,
-    {
-        let buf: &ColumnarBuffer<S, PoolSlotLease> = batch.as_ref();
-        let offset = col.offset(buf.capacity());
-        let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
-        let len = buf.len() as isize;
-        let item_size = col.elem_size() as isize;
-
+        owner: Py<PyAny>,
+    ) -> Self {
         Self {
             _owner: owner,
             ptr,
             len,
             item_size,
-            format: C::Value::FORMAT,
+            format,
             writable,
             shape: [len],
             strides: [item_size],
@@ -235,8 +146,153 @@ impl ColumnView {
     }
 }
 
+/// Declare a `#[pyclass]` batch wrapper with dict-style column access.
+///
+/// Columns are accessed via `batch["col_name"]` in Python. Writability is
+/// automatically determined: if the batch is the sole owner of the underlying
+/// buffer, the view is writable; otherwise it is read-only.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// columnar::pybatch!(PySequenceBatch, sequence::SequenceSchema, {
+///     id => sequence::schema::id,
+/// });
+/// ```
+///
+/// Python usage:
+/// ```python
+/// ids = np.asarray(batch["id"])  # auto read-only or writable
+/// ```
+/// Internal macro that generates the `__getitem__` body. Not public API.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __pybatch_impl {
+    ($name:ident, $schema:ty,
+     cols: [ $( $method:ident => $col:expr ),* ],
+     groups: [ $( $gmethod:ident [ $gn:literal ] => $gcol:expr ),* ]
+    ) => {
+
+        #[::pyo3::pyclass(str = "{batch:?}")]
+        pub struct $name {
+            pub batch: ::std::option::Option<$crate::ring::Batch<$schema, ()>>,
+        }
+
+        #[::pyo3::pymethods]
+        impl $name {
+            fn __getitem__(slf: ::pyo3::Py<Self>, py: ::pyo3::Python<'_>, key: &::pyo3::Bound<'_, ::pyo3::PyAny>)
+                -> ::pyo3::PyResult<::pyo3::Py<::pyo3::PyAny>>
+            {
+                let this = slf.borrow(py);
+                let batch = this.batch.as_ref()
+                    .ok_or(::pyo3::exceptions::PyRuntimeError::new_err("batch consumed"))?;
+
+                let writable = batch.is_exclusive();
+                let buf = batch.as_ref();
+                let capacity = buf.capacity();
+                let len = buf.len() as isize;
+
+                use $crate::buffer::ByteBuffer as _;
+
+                let (col_name, sub_index): (String, Option<usize>) = if let Ok(tuple) = key.cast::<::pyo3::types::PyTuple>() {
+                    if tuple.len() != 2 {
+                        return Err(::pyo3::exceptions::PyKeyError::new_err("expected (name, index) tuple"));
+                    }
+                    let name: String = tuple.get_item(0)?.extract()?;
+                    let idx: usize = tuple.get_item(1)?.extract()?;
+                    (name, Some(idx))
+                } else {
+                    (key.extract::<String>()?, None)
+                };
+
+                match (col_name.as_str(), sub_index) {
+                    $(
+                        (stringify!($method), None) => {
+                            let col = $col;
+                            let offset = $crate::buffer::ColumnType::offset(col, capacity);
+                            let item_size = $crate::buffer::ColumnType::elem_size(col) as isize;
+                            let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
+                            let format = $crate::ext::pyo3::PyColumnView::format_for_column(col);
+                            let view = unsafe {
+                                $crate::ext::pyo3::PyColumnView::new_raw(
+                                    ptr, len, item_size, format, writable,
+                                    slf.clone_ref(py).into_any(),
+                                )
+                            };
+                            Ok(::pyo3::Py::new(py, view)?.into_any())
+                        }
+                    )*
+                    $(
+                        (stringify!($gmethod), Some(k)) => {
+                            if k >= $gn {
+                                return Err(::pyo3::exceptions::PyIndexError::new_err(
+                                    format!("sub-column index {} out of range (0..{})", k, $gn)
+                                ));
+                            }
+                            let col = $gcol;
+                            let offset = $crate::buffer::GroupColumnType::offset(col, k, capacity);
+                            let item_size = $crate::buffer::GroupColumnType::elem_size(col) as isize;
+                            let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
+                            let format = $crate::ext::pyo3::PyColumnView::format_for_group_column(col);
+                            let view = unsafe {
+                                $crate::ext::pyo3::PyColumnView::new_raw(
+                                    ptr, len, item_size, format, writable,
+                                    slf.clone_ref(py).into_any(),
+                                )
+                            };
+                            Ok(::pyo3::Py::new(py, view)?.into_any())
+                        }
+                        (stringify!($gmethod), None) => {
+                            let col = $gcol;
+                            let item_size = $crate::buffer::GroupColumnType::elem_size(col) as isize;
+                            let format = $crate::ext::pyo3::PyColumnView::format_for_group_column(col);
+                            let mut views = Vec::with_capacity($gn);
+                            for k in 0..$gn {
+                                let offset = $crate::buffer::GroupColumnType::offset(col, k, capacity);
+                                let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
+                                let view = unsafe {
+                                    $crate::ext::pyo3::PyColumnView::new_raw(
+                                        ptr, len, item_size, format, writable,
+                                        slf.clone_ref(py).into_any(),
+                                    )
+                                };
+                                views.push(::pyo3::Py::new(py, view)?);
+                            }
+                            Ok(::pyo3::types::PyList::new(py, views)?.into_any().unbind())
+                        }
+                    )*
+                    _ => Err(::pyo3::exceptions::PyKeyError::new_err(
+                        format!("unknown column: '{col_name}'")
+                    )),
+                }
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! pybatch {
+    // With groups
+    ($name:ident, $schema:ty,
+     { $( $method:ident => $col:expr ),* $(,)? },
+     groups: { $( $gmethod:ident [ $gn:literal ] => $gcol:expr ),* $(,)? }
+    ) => {
+        $crate::__pybatch_impl!($name, $schema,
+            cols: [ $( $method => $col ),* ],
+            groups: [ $( $gmethod [ $gn ] => $gcol ),* ]
+        );
+    };
+    // Without groups
+    ($name:ident, $schema:ty, { $( $method:ident => $col:expr ),* $(,)? }) => {
+        $crate::__pybatch_impl!($name, $schema,
+            cols: [ $( $method => $col ),* ],
+            groups: []
+        );
+    };
+}
+
 #[pymethods]
-impl ColumnView {
+impl PyColumnView {
 
     unsafe fn __getbuffer__(&self,view: *mut ffi::Py_buffer, flags: c_int) 
         -> PyResult<()> 

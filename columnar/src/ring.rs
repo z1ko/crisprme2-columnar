@@ -93,6 +93,11 @@ impl<S: Schema, M> Batch<S, M> {
         &self.metadata
     }
 
+    /// Returns `true` if this batch is the sole owner of the underlying buffer.
+    pub fn is_exclusive(&self) -> bool {
+        Arc::strong_count(&self.buffer) == 1
+    }
+
     /// Replace the metadata, keeping the same buffer.
     pub fn with_metadata<M2>(self, metadata: M2) -> Batch<S, M2> {
         Batch {

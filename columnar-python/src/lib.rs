@@ -5,8 +5,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use columnar::macros::Columnar;
 use columnar::buffer::Schema;
-use columnar::ring::{Batch, ConnectorRx, ConnectorTx, Pool};
-use columnar::ext::pyo3::ColumnView;
+use columnar::ring::{ConnectorRx, ConnectorTx, Pool};
 
 const MAX_STR_LEN: usize = 32;
 const MAX_ANNOTATIONS_LEN: usize = 10;
@@ -57,90 +56,17 @@ pub mod sequence {
 // Batch wrappers — schema-specific Python-visible batch handles
 // =============================================================================
 
-/// Batch of sequences
-#[pyclass(str = "{batch:?}")]
-pub struct PySequenceBatch {
-    batch: Option<Batch<sequence::SequenceSchema, ()>>,
-}
+columnar::pybatch!(PySequenceBatch, sequence::SequenceSchema, {
+    id => sequence::schema::id,
+});
 
-#[pymethods]
-impl PySequenceBatch {
-    fn ids(slf: Py<Self>, py: Python<'_>) -> PyResult<ColumnView> {
-        let mut this = slf.borrow_mut(py);
-        let batch = this.batch.as_mut()
-            .ok_or(PyRuntimeError::new_err("batch consumed"))?;
-        Ok(ColumnView::from_batch(
-            batch, sequence::schema::id, slf.clone_ref(py).into_any(), true))
-    }
-}
-
-/// Batch of alignments
-#[pyclass(str = "{batch:?}")]
-pub struct PyAlignmentBatch {
-    batch: Option<Batch<alignment::AlignmentSchema, ()>>,
-}
-
-#[pymethods]
-impl PyAlignmentBatch {
-    fn occurences(slf: Py<Self>, py: Python<'_>) -> PyResult<ColumnView> {
-        let mut this = slf.borrow_mut(py);
-        let batch = this.batch.as_mut()
-            .ok_or(PyRuntimeError::new_err("batch consumed"))?;
-        Ok(ColumnView::from_batch(
-            batch, alignment::schema::occurence, slf.clone_ref(py).into_any(), true))
-    }
-}
-
-// =============================================================================
-// Source stage — Python produces sequences, Rust pipeline transforms them
-// =============================================================================
-
-/// Source handle: Python acquires batches, fills them, and publishes.
-#[pyclass(unsendable)]
-pub struct PySequenceSource {
-    tx: Option<ConnectorTx<sequence::SequenceSchema, ()>>,
-    pool: Arc<Pool<sequence::SequenceSchema>>,
-}
-
-#[pymethods]
-impl PySequenceSource {
-    fn acquire(&self) -> PyResult<PySequenceBatch> {
-        let batch = self.pool.acquire()
-            .map_err(|e| PyRuntimeError::new_err(format!("pool acquire failed: {e}")))?;
-        Ok(PySequenceBatch { batch: Some(batch) })
-    }
-
-    fn publish(&self, py_batch: &mut PySequenceBatch, len: usize) -> PyResult<()> {
-        let mut batch = py_batch.batch.take()
-            .ok_or(PyRuntimeError::new_err("batch already consumed"))?;
-        batch.as_mut().set_len(len);
-
-        let tx = self.tx.as_ref()
-            .ok_or(PyRuntimeError::new_err("source is closed"))?;
-        tx.send(batch)
-            .map_err(|e| PyRuntimeError::new_err(format!("downstream disconnected: {e}")))?;
-        Ok(())
-    }
-
-    fn close(&mut self) { self.tx.take(); }
-}
-
-// =============================================================================
-// Sink stage — Python consumes alignment results
-// =============================================================================
-
-/// Sink handle: Python receives read-only alignment batches.
-#[pyclass]
-pub struct PyAlignmentSink {
-    rx: columnar::ring::ConnectorRx<alignment::AlignmentSchema, ()>,
-}
-
-#[pymethods]
-impl PyAlignmentSink {
-    fn recv(&self) -> Option<PyAlignmentBatch> {
-        self.rx.recv().ok().map(|batch| PyAlignmentBatch { batch: Some(batch) })
-    }
-}
+columnar::pybatch!(PyAlignmentBatch, alignment::AlignmentSchema, {
+    occurence => alignment::schema::occurence,
+    strand => alignment::schema::strand,
+}, groups: {
+    score[4] => alignment::schema::score,
+    annotations[10] => alignment::schema::annotations,
+});
 
 // =============================================================================
 // Pipeline factory — wires up stages with Python callbacks
@@ -200,7 +126,7 @@ impl PyPipeline {
 
 #[pymodule]
 mod columnar_python {
-    use columnar::{ext::pyo3::ColumnView, ring::connector};
+    use columnar::{ext::pyo3::PyColumnView, ring::connector};
     use pyo3::prelude::*;
     use crate::*;
 
@@ -252,11 +178,9 @@ mod columnar_python {
 
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
-        m.add_class::<ColumnView>()?;
+        m.add_class::<PyColumnView>()?;
         m.add_class::<PySequenceBatch>()?;
         m.add_class::<PyAlignmentBatch>()?;
-        m.add_class::<PySequenceSource>()?;
-        m.add_class::<PyAlignmentSink>()?;
         Ok(())
     }
 }
