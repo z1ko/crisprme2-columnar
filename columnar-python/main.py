@@ -21,7 +21,9 @@ def transform_batch(input: col.PySequenceBatch, output: col.PyAlignmentBatch):
         print(scores[i])
 
     # 'rseq' is a single column with an array for row, returns np array of shape (rows, array_len)
-    # rseq = np.asarray(output["rseq"], copy = False)
+    rseq = np.asarray(output["rseq"], copy = False)
+    print(rseq.shape)
+
 
 pipeline = col.create_pipeline(2, 1000000,
     transform = transform_batch,

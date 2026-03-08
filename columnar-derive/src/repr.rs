@@ -19,19 +19,25 @@ pub struct FieldIR<'a> {
     /// The field's identifier.
     pub name: &'a Ident,
     /// The per-element type: `T` from `[T; N]` for groups, or the field type
-    /// itself for simple fields.
-    pub elem_ty: &'a syn::Type,
-    /// `Some(N)` for group fields (the array length expression), `None` for
-    /// simple fields.
-    pub array_len: Option<&'a syn::Expr>,
-    /// Whether this field is excluded from the Python batch wrapper.
-    pub skip_py: bool,
+    /// itself for simple and array fields.
+    pub ty: &'a syn::Type,
+    /// How to manage this field: simple, array or group
+    pub kind: FieldKindIR<'a>
 }
+
+pub enum FieldKindIR<'a> {
+    Simple,
+    Array { elem_ty: &'a syn::Type, len: &'a syn::Expr },
+    Group { len: &'a syn::Expr }
+} 
 
 impl FieldIR<'_> {
     /// Returns `true` if this field is a group column (`[T; N]`).
     pub fn is_group(&self) -> bool {
-        self.array_len.is_some()
+        if let FieldKindIR::Group { len: _ } = &self.kind {
+            return true;
+        }
+        return false;
     }
 }
 
@@ -70,18 +76,27 @@ pub fn lower<'a>(parsed: &ParsedStruct<'a>) -> syn::Result<SchemaIR<'a>> {
                 )),
             };
             fields.push(FieldIR {
-                name: f.name,
-                elem_ty,
-                array_len: Some(array_len),
-                skip_py: f.skip_py,
+                name: f.name, ty: elem_ty,
+                kind: FieldKindIR::Group { 
+                    len: array_len 
+                }
             });
         } else {
-            fields.push(FieldIR {
-                name: f.name,
-                elem_ty: f.ty,
-                array_len: None,
-                skip_py: f.skip_py,
-            });
+            // Distinguish between simple and array types
+            if let syn::Type::Array(arr) = f.ty {
+                fields.push(FieldIR { 
+                    name: f.name, ty: f.ty, 
+                    kind: FieldKindIR::Array {
+                        elem_ty: &*arr.elem,
+                        len: &arr.len 
+                    } 
+                });
+            } else {
+                fields.push(FieldIR {
+                    name: f.name, ty: f.ty,
+                    kind: FieldKindIR::Simple,
+                });
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use crate::repr::SchemaIR;
+use crate::repr::{FieldKindIR, SchemaIR};
 
 /// Generate SoAWrite and SoARead implementations.
 pub fn generate(ir: &SchemaIR) -> TokenStream {
@@ -39,15 +39,15 @@ fn gen_write(ir: &SchemaIR) -> TokenStream {
 
     let write_fields: Vec<TokenStream> = ir.fields.iter().enumerate().map(|(i, f)| {
         let name = f.name;
-        let elem_ty = f.elem_ty;
+        let elem_ty = f.ty;
 
-        if let Some(array_len) = f.array_len {
+        if let FieldKindIR::Group{ len } = f.kind {
             quote! {
                 {
                     let first = #schema_name::LAYOUT.fields[#i];
                     let elem_size = ::std::mem::size_of::<#elem_ty>();
                     let mut k = 0usize;
-                    while k < #array_len {
+                    while k < #len {
                         let col_offset = #schema_name::offset(first + k, row_capacity);
                         let start = col_offset + row * elem_size;
                         data[start..start + elem_size]
@@ -79,16 +79,16 @@ fn gen_read(ir: &SchemaIR) -> TokenStream {
 
     let read_fields: Vec<TokenStream> = ir.fields.iter().enumerate().map(|(i, f)| {
         let name = f.name;
-        let elem_ty = f.elem_ty;
+        let elem_ty = f.ty;
 
-        if let Some(array_len) = f.array_len {
+        if let FieldKindIR::Group{ len } = f.kind {
             quote! {
                 #name: {
                     let first = #schema_name::LAYOUT.fields[#i];
                     let elem_size = ::std::mem::size_of::<#elem_ty>();
-                    let mut arr: [#elem_ty; #array_len] = [<#elem_ty as ::bytemuck::Zeroable>::zeroed(); #array_len];
+                    let mut arr: [#elem_ty; #len] = [<#elem_ty as ::bytemuck::Zeroable>::zeroed(); #len];
                     let mut k = 0usize;
-                    while k < #array_len {
+                    while k < #len {
                         let col_offset = #schema_name::offset(first + k, row_capacity);
                         let start = col_offset + row * elem_size;
                         arr[k] = *::bytemuck::from_bytes(&data[start..start + elem_size]);

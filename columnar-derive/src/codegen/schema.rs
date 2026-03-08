@@ -1,7 +1,7 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use crate::repr::SchemaIR;
+use crate::repr::{FieldKindIR, SchemaIR};
 
 /// Generate the Schema struct, Layout computation, and column accessor constants.
 pub fn generate(ir: &SchemaIR) -> TokenStream {
@@ -10,45 +10,50 @@ pub fn generate(ir: &SchemaIR) -> TokenStream {
 
     // Total column count as a const expression: sum of counts per field
     let count_parts: Vec<TokenStream> = ir.fields.iter().map(|f| {
-        match f.array_len {
-            Some(len) => quote! { #len },
-            None => quote! { 1usize },
+        match f.kind {
+            FieldKindIR::Group{ len } => quote! { #len },
+            _ => quote! { 1usize }
         }
     }).collect();
     let ccnt_expr = quote! { #( #count_parts )+* };
 
     // Generate LayoutUnit array entries
     let units: Vec<TokenStream> = ir.fields.iter().enumerate().map(|(i, f)| {
-        let elem_ty = f.elem_ty;
-        let count: TokenStream = match f.array_len {
-            Some(len) => quote! { #len },
-            None => quote! { 1usize },
-        };
-        quote! {
-            ::columnar::buffer::LayoutUnit {
-                field: #i,
-                align: ::std::mem::align_of::<#elem_ty>(),
-                size: ::std::mem::size_of::<#elem_ty>(),
-                count: #count
-            }
+        let elem_ty = f.ty;
+        match f.kind {
+            FieldKindIR::Group { len } => quote! {
+                ::columnar::buffer::LayoutUnit {
+                    field: #i,
+                    align: ::std::mem::align_of::<#elem_ty>(),
+                    size: ::std::mem::size_of::<#elem_ty>(),
+                    count: #len
+                }
+            },
+            _ => quote! {
+                ::columnar::buffer::LayoutUnit {
+                    field: #i,
+                    align: ::std::mem::align_of::<#elem_ty>(),
+                    size: ::std::mem::size_of::<#elem_ty>(),
+                    count: 1usize
+                }
+            },
         }
     }).collect();
 
     // Generate column accessor constants in schema module
     let columns: Vec<TokenStream> = ir.fields.iter().enumerate().map(|(i, f)| {
         let name = f.name;
-        let elem_ty = f.elem_ty;
-        if f.is_group() {
-            quote! {
+        let elem_ty = f.ty;
+        match f.kind {
+            FieldKindIR::Group { len: _ } => quote! {
                 pub const #name: ::columnar::buffer::ColumnGroupIdx<
                     #schema_name,
                     { #schema_name::LAYOUT.fields[#i] },
                     { #schema_name::LAYOUT.counts[#i] },
                     #elem_ty
                 > = ::columnar::buffer::ColumnGroupIdx::NEW;
-            }
-        } else {
-            quote! {
+            },
+            _ => quote! {
                 pub const #name: ::columnar::buffer::ColumnIdx<
                     #schema_name,
                     { #schema_name::LAYOUT.fields[#i] },

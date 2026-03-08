@@ -15,9 +15,6 @@ pub struct ParsedField<'a> {
     /// `true` when `#[columnar(group)]` is present — the field will be
     /// expanded into N separate sub-columns.
     pub group: bool,
-    /// `true` when `#[columnar(skip_py)]` is present — the field will be
-    /// excluded from the generated Python batch wrapper.
-    pub skip_py: bool,
 }
 
 /// Raw parsed information for the whole struct being derived.
@@ -50,18 +47,16 @@ pub fn parse(input: &DeriveInput) -> syn::Result<ParsedStruct<'_>> {
         let ty = &field.ty;
 
         let mut group = false;
-        let mut skip_py = false;
         for attr in &field.attrs {
             if attr.path().is_ident("columnar") {
                 let _ = attr.parse_nested_meta(|meta| {
                     if meta.path.is_ident("group") { group = true; }
-                    if meta.path.is_ident("skip_py") { skip_py = true; }
                     Ok(())
                 });
             }
         }
 
-        parsed_fields.push(ParsedField { name, ty, group, skip_py });
+        parsed_fields.push(ParsedField { name, ty, group });
     }
 
     // Parse struct-level #[columnar(pyclass = "Name")]

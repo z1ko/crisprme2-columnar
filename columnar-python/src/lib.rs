@@ -11,8 +11,6 @@ const MAX_STR_LEN: usize = 32;
 const MAX_ANNOTATIONS_LEN: usize = 10;
 const MAX_SCORES_LEN: usize = 4;
 
-type StrBytes = [u8; MAX_STR_LEN];
-
 pub mod alignment {
     use super::*;
 
@@ -28,10 +26,8 @@ pub mod alignment {
         pub strand: u8,
 
         /// row-major byte buffers
-        #[columnar(skip_py)]
-        pub rguide: StrBytes,
-        #[columnar(skip_py)]
-        pub rseq: StrBytes,
+        pub rguide: [u8; MAX_STR_LEN],
+        pub rseq: [u8; MAX_STR_LEN],
 
         /// alignment results
         pub mism: u8,
