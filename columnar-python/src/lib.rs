@@ -20,6 +20,9 @@ pub mod alignment {
     #[columnar(pyclass = "PyAlignmentBatch")]
     pub struct Alignment {
 
+        /// unique identifier for this alignment
+        pub id: u32,
+
         /// position
         pub occurence: u32,
         pub strand: u8,
@@ -131,11 +134,12 @@ mod columnar_python {
     /// The `transform` callback receives a `PyAlignmentWriteBatch` for in-place modification.
     /// After the callback returns, the batch is auto-published downstream.
     #[pyfunction]
-    fn create_pipeline(transform: Py<PyAny>,) -> PyPipeline {
+    fn create_pipeline(slots: usize, elements: usize, transform: Py<PyAny>,) -> PyPipeline {
 
+        println!("Size of a single alignment: {} bytes", alignment::AlignmentSchema::LAYOUT.stride);
         let (seq_pool, align_pool) = (
-            Arc::new(Pool::<sequence::SequenceSchema>::new(2, 128)),
-            Arc::new(Pool::<alignment::AlignmentSchema>::new(2, 128))
+            Arc::new(Pool::<sequence::SequenceSchema>::new(slots, elements)),
+            Arc::new(Pool::<alignment::AlignmentSchema>::new(slots, elements))
         );
 
         let mut pipeline = Pipeline::new();

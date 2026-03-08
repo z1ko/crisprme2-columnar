@@ -145,19 +145,20 @@ impl PyColumnView {
         }
     }
 
-    /// Create a 2D view for a `[T; N]` array column.
+    /// Create a 2D view with explicit shape and strides.
     ///
-    /// The resulting `memoryview` has shape `(rows, cols)` and C-contiguous
-    /// strides, directly usable as a 2D numpy array.
+    /// Used for both:
+    /// - Non-group `[T; N]` columns: shape `(rows, N)`, strides `(N*item_size, item_size)`
+    /// - Group columns: shape `(N, rows)`, strides `(item_size*row_capacity, item_size)`
     ///
     /// # Safety
     ///
-    /// `ptr` must point to valid memory for `rows * cols * item_size` bytes,
+    /// `ptr` must point to valid memory covering the full strided range,
     /// and must remain valid for the lifetime of `owner`.
     pub unsafe fn new_raw_2d(
         ptr: *mut u8,
-        rows: isize,
-        cols: isize,
+        shape: [isize; 2],
+        strides: [isize; 2],
         item_size: isize,
         format: &'static CStr,
         writable: bool,
@@ -170,8 +171,8 @@ impl PyColumnView {
             format,
             writable,
             ndim: 2,
-            shape: [rows, cols],
-            strides: [cols * item_size, item_size],
+            shape,
+            strides,
         }
     }
 }
@@ -211,8 +212,8 @@ macro_rules! __pybatch_impl {
 
         #[::pyo3::pymethods]
         impl $name {
-            fn __getitem__(slf: ::pyo3::Py<Self>, py: ::pyo3::Python<'_>, key: &::pyo3::Bound<'_, ::pyo3::PyAny>)
-                -> ::pyo3::PyResult<::pyo3::Py<::pyo3::PyAny>>
+            fn __getitem__(slf: ::pyo3::Py<Self>, py: ::pyo3::Python<'_>, key: &str)
+                -> ::pyo3::PyResult<::pyo3::Py<$crate::ext::pyo3::PyColumnView>>
             {
                 let this = slf.borrow(py);
                 let batch = this.batch.as_ref()
@@ -224,21 +225,9 @@ macro_rules! __pybatch_impl {
                 let len = buf.len() as isize;
 
                 use $crate::buffer::ByteBuffer as _;
-
-                let (col_name, sub_index): (String, Option<usize>) = if let Ok(tuple) = key.cast::<::pyo3::types::PyTuple>() {
-                    if tuple.len() != 2 {
-                        return Err(::pyo3::exceptions::PyKeyError::new_err("expected (name, index) tuple"));
-                    }
-                    let name: String = tuple.get_item(0)?.extract()?;
-                    let idx: usize = tuple.get_item(1)?.extract()?;
-                    (name, Some(idx))
-                } else {
-                    (key.extract::<String>()?, None)
-                };
-
-                match (col_name.as_str(), sub_index) {
+                match key {
                     $(
-                        (stringify!($method), None) => {
+                        stringify!($method) => {
                             let col = $col;
                             let offset = col.offset(capacity);
                             let item_size = col.elem_size() as isize;
@@ -250,67 +239,53 @@ macro_rules! __pybatch_impl {
                                     slf.clone_ref(py).into_any(),
                                 )
                             };
-                            Ok(::pyo3::Py::new(py, view)?.into_any())
+                            Ok(::pyo3::Py::new(py, view)?)
                         }
                     )*
                     $(
-                        (stringify!($gmethod), Some(k)) => {
-                            if k >= $gn {
-                                return Err(::pyo3::exceptions::PyIndexError::new_err(
-                                    format!("sub-column index {} out of range (0..{})", k, $gn)
-                                ));
-                            }
+                        stringify!($gmethod) => {
                             let col = $gcol;
-                            let offset = col.offset(k, capacity);
                             let item_size = col.elem_size() as isize;
-                            let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
                             let format = $crate::ext::pyo3::PyColumnView::format_for_group_column(col);
+                            // First sub-column start; sub-columns are contiguous in layout
+                            let offset = col.offset(0, capacity);
+                            let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
+                            // Shape (N, rows), stride between sub-columns = item_size * row_capacity
                             let view = unsafe {
-                                $crate::ext::pyo3::PyColumnView::new_raw(
-                                    ptr, len, item_size, format, writable,
+                                $crate::ext::pyo3::PyColumnView::new_raw_2d(
+                                    ptr,
+                                    [$gn as isize, len],
+                                    [item_size * capacity as isize, item_size],
+                                    item_size, format, writable,
                                     slf.clone_ref(py).into_any(),
                                 )
                             };
-                            Ok(::pyo3::Py::new(py, view)?.into_any())
-                        }
-                        (stringify!($gmethod), None) => {
-                            let col = $gcol;
-                            let item_size = col.elem_size() as isize;
-                            let format = $crate::ext::pyo3::PyColumnView::format_for_group_column(col);
-                            let mut views = Vec::with_capacity($gn);
-                            for k in 0..$gn {
-                                let offset = col.offset(k, capacity);
-                                let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
-                                let view = unsafe {
-                                    $crate::ext::pyo3::PyColumnView::new_raw(
-                                        ptr, len, item_size, format, writable,
-                                        slf.clone_ref(py).into_any(),
-                                    )
-                                };
-                                views.push(::pyo3::Py::new(py, view)?);
-                            }
-                            Ok(::pyo3::types::PyList::new(py, views)?.into_any().unbind())
+                            Ok(::pyo3::Py::new(py, view)?)
                         }
                     )*
                     $(
-                        (stringify!($amethod), None) => {
+                        stringify!($amethod) => {
                             let col = $acol;
                             let offset = col.offset(capacity);
                             let item_size = ::std::mem::size_of::<$aty>() as isize;
                             let cols = $an as isize;
                             let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
                             let format = <$aty as $crate::ext::pyo3::PyBufferFormat>::FORMAT;
+                            // Shape (rows, N), C-contiguous strides
                             let view = unsafe {
                                 $crate::ext::pyo3::PyColumnView::new_raw_2d(
-                                    ptr, len, cols, item_size, format, writable,
+                                    ptr,
+                                    [len, cols],
+                                    [cols * item_size, item_size],
+                                    item_size, format, writable,
                                     slf.clone_ref(py).into_any(),
                                 )
                             };
-                            Ok(::pyo3::Py::new(py, view)?.into_any())
+                            Ok(::pyo3::Py::new(py, view)?)
                         }
                     )*
                     _ => Err(::pyo3::exceptions::PyKeyError::new_err(
-                        format!("unknown column: '{col_name}'")
+                        format!("unknown column: '{key}'")
                     )),
                 }
             }
