@@ -34,8 +34,8 @@
 //! }
 //!
 //! // Allocate a buffer for 1024 rows
-//! let mut buf: ColumnarBuffer<SequenceSchema, RingSlot> =
-//!     RingSlot::new(1024 * SequenceSchema::STRIDE).columnar();
+//! let mut buf: ColumnarBuffer<SequenceSchema, AlignedBox> =
+//!     AlignedBox::new(1024 * SequenceSchema::STRIDE).columnar();
 //!
 //! // Push a full row at once
 //! buf.push(Sequence { id: 1, score: 0.95, elements: [0u8; 32] });
@@ -141,32 +141,11 @@ impl ByteBuffer for AlignedBox {
     }
 }
 
-// =============================================================================
-// RingSlot (convenience wrapper)
-// =============================================================================
-
-/// A plain heap-allocated byte slab intended to be used as a slot in a ring
-/// buffer pool, but usable as a standalone backing store for [`ColumnarBuffer`].
-///
-/// Backed by [`AlignedBox`] for guaranteed 8-byte alignment.
-pub struct RingSlot {
-    pub data: AlignedBox
-}
-
-impl RingSlot {
-    pub fn new(bytes: usize) -> Self {
-        Self { data: AlignedBox::new(bytes) }
-    }
-
-    /// Wrap this slot in a typed columnar buffer. Takes ownership of `self`.
-    pub fn columnar<S: Schema>(self) -> ColumnarBuffer<S, RingSlot> {
+impl AlignedBox {
+    /// Wrap this slab in a typed columnar buffer. Takes ownership of `self`.
+    pub fn columnar<S: Schema>(self) -> ColumnarBuffer<S, AlignedBox> {
         ColumnarBuffer::new(self)
     }
-}
-
-impl ByteBuffer for RingSlot {
-    fn as_bytes(&self) -> &[u8] { self.data.as_bytes() }
-    fn as_bytes_mut(&mut self) -> &mut [u8] { self.data.as_bytes_mut() }
 }
 
 // =============================================================================
@@ -509,7 +488,7 @@ impl_columns!((0, C0), (1, C1), (2, C2), (3, C3), (4, C4), (5, C5), (6, C6), (7,
 ///
 /// - `S` must implement [`Schema`]. In practice this is always a type emitted by
 ///   `#[derive(Columnar)]`, e.g. `Columnar<SequenceSchema, _>`.
-/// - `B` must implement [`ByteBuffer`]. Use [`RingSlot`] for plain heap storage,
+/// - `B` must implement [`ByteBuffer`]. Use [`AlignedBox`] for plain heap storage,
 ///   or supply your own type for GPU-pinned memory, memory-mapped files, etc.
 ///
 /// # Capacity vs. length

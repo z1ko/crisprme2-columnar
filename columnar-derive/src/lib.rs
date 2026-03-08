@@ -191,7 +191,7 @@ fn expand_simple(
             };
         }
 
-        impl ::columnar::Schema for #schema_name {
+        impl ::columnar::buffer::Schema for #schema_name {
             #[inline]
             fn stride() -> usize { Self::STRIDE }
 
@@ -201,7 +201,7 @@ fn expand_simple(
             }
         }
 
-        impl ::columnar::SoAWrite for #struct_name {
+        impl ::columnar::buffer::SoAWrite for #struct_name {
             type Schema = #schema_name;
 
             #[inline]
@@ -217,7 +217,7 @@ fn expand_simple(
             }
         }
 
-        impl ::columnar::SoARead for #struct_name {
+        impl ::columnar::buffer::SoARead for #struct_name {
             type Schema = #schema_name;
 
             #[inline]
@@ -243,7 +243,7 @@ fn expand_simple(
                 #[derive(Clone, Copy)]
                 pub struct #field_names;
 
-                impl ::columnar::ColumnType for #field_names {
+                impl ::columnar::buffer::ColumnType for #field_names {
                     type Schema = #schema_name;
                     type Value  = #field_types;
 
@@ -258,7 +258,7 @@ fn expand_simple(
                     }
                 }
 
-                impl ::columnar::ColumnSelector for #field_names {
+                impl ::columnar::buffer::ColumnSelector for #field_names {
                     type Schema = #schema_name;
                     type Ref<'a> = &'a [#field_types];
                     type Mut<'a> = &'a mut [#field_types];
@@ -450,7 +450,7 @@ fn expand_with_groups(
                 #[derive(Clone, Copy)]
                 pub struct #name;
 
-                impl ::columnar::GroupColumnType<{ #array_len }> for #name {
+                impl ::columnar::buffer::GroupColumnType<{ #array_len }> for #name {
                     type Schema = #schema_name;
                     type Value = #elem_type;
 
@@ -465,7 +465,7 @@ fn expand_with_groups(
                     }
                 }
 
-                impl ::columnar::ColumnSelector for #name {
+                impl ::columnar::buffer::ColumnSelector for #name {
                     type Schema = #schema_name;
                     type Ref<'a> = [&'a [#elem_type]; #array_len];
                     type Mut<'a> = [&'a mut [#elem_type]; #array_len];
@@ -527,7 +527,7 @@ fn expand_with_groups(
                 #[derive(Clone, Copy)]
                 pub struct #name;
 
-                impl ::columnar::ColumnType for #name {
+                impl ::columnar::buffer::ColumnType for #name {
                     type Schema = #schema_name;
                     type Value  = #ty;
 
@@ -542,7 +542,7 @@ fn expand_with_groups(
                     }
                 }
 
-                impl ::columnar::ColumnSelector for #name {
+                impl ::columnar::buffer::ColumnSelector for #name {
                     type Schema = #schema_name;
                     type Ref<'a> = &'a [#ty];
                     type Mut<'a> = &'a mut [#ty];
@@ -649,7 +649,7 @@ fn expand_with_groups(
             };
         }
 
-        impl ::columnar::Schema for #schema_name {
+        impl ::columnar::buffer::Schema for #schema_name {
             #[inline]
             fn stride() -> usize { Self::STRIDE }
 
@@ -659,7 +659,7 @@ fn expand_with_groups(
             }
         }
 
-        impl ::columnar::SoAWrite for #struct_name {
+        impl ::columnar::buffer::SoAWrite for #struct_name {
             type Schema = #schema_name;
 
             #[inline]
@@ -668,7 +668,7 @@ fn expand_with_groups(
             }
         }
 
-        impl ::columnar::SoARead for #struct_name {
+        impl ::columnar::buffer::SoARead for #struct_name {
             type Schema = #schema_name;
 
             #[inline]

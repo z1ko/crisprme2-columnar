@@ -37,6 +37,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 
 use crate::buffer::{ByteBuffer, ColumnType, ColumnarBuffer, GroupColumnType, Schema};
+use crate::ring::{Batch, PoolSlotLease};
 
 // =============================================================================
 // PyBufferFormat
@@ -198,6 +199,39 @@ impl ColumnView {
                 }
             })
             .collect()
+    }
+
+    /// Create a `ColumnView` from a `Batch`.
+    ///
+    /// If `writable` is true, the batch must be the sole owner (no clones).
+    pub fn from_batch<S, M, C>(
+        batch: &mut Batch<S, M>,
+        col: C,
+        owner: Py<PyAny>,
+        writable: bool,
+    ) -> Self
+    where
+        S: Schema,
+        M: 'static,
+        C: ColumnType<Schema = S>,
+        C::Value: PyBufferFormat,
+    {
+        let buf: &ColumnarBuffer<S, PoolSlotLease> = batch.as_ref();
+        let offset = col.offset(buf.capacity());
+        let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
+        let len = buf.len() as isize;
+        let item_size = col.elem_size() as isize;
+
+        Self {
+            _owner: owner,
+            ptr,
+            len,
+            item_size,
+            format: C::Value::FORMAT,
+            writable,
+            shape: [len],
+            strides: [item_size],
+        }
     }
 }
 

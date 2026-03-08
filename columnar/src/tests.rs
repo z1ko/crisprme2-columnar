@@ -2,7 +2,7 @@
 // surrounding module, so multiple derived structs must live in separate modules
 // to avoid the name conflict.
 
-use crate::buffer::{ByteBuffer, ColumnarBuffer, RingSlot, Schema};
+use crate::buffer::{ByteBuffer, ColumnarBuffer, AlignedBox, Schema};
 use crate::macros::Columnar;
 
 mod point {
@@ -65,12 +65,12 @@ use single::{Single, SingleSchema, schema as ss};
 use wide::{Wide, WideSchema, schema as ws};
 use scrambled::{Scrambled, ScrambledSchema, schema as scr};
 
-fn point_buf(rows: usize) -> ColumnarBuffer<PointSchema, RingSlot> {
-    RingSlot::new(rows * PointSchema::stride()).columnar()
+fn point_buf(rows: usize) -> ColumnarBuffer<PointSchema, AlignedBox> {
+    AlignedBox::new(rows * PointSchema::stride()).columnar()
 }
 
-fn record_buf(rows: usize) -> ColumnarBuffer<RecordSchema, RingSlot> {
-    RingSlot::new(rows * RecordSchema::stride()).columnar()
+fn record_buf(rows: usize) -> ColumnarBuffer<RecordSchema, AlignedBox> {
+    AlignedBox::new(rows * RecordSchema::stride()).columnar()
 }
 
 // =============================================================================
@@ -471,7 +471,7 @@ fn detach_and_rewrap_preserves_bytes() {
     let mut buf = point_buf(4);
     buf.push(Point { x: 1.0, y: 2.0 });
 
-    let slot: RingSlot = buf.detach();
+    let slot: AlignedBox = buf.detach();
     // Rewrap — row_count resets, but bytes are intact
     let buf2: ColumnarBuffer<PointSchema, _> = ColumnarBuffer::new(slot);
     let xs: &[f32] = bytemuck::cast_slice(&buf2.storage.as_bytes()[0..16]);
@@ -601,8 +601,8 @@ fn scrambled_raw_layout() {
     // block 1 (a): bytes 16..20 = [a0, a1, a2, a3] (4 * 1)
     // block 2 (c): bytes 20..24 = [c0, c1, c2, c3] (4 * 1)
     let rows = 4usize;
-    let mut buf: ColumnarBuffer<ScrambledSchema, RingSlot> =
-        RingSlot::new(rows * ScrambledSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<ScrambledSchema, AlignedBox> =
+        AlignedBox::new(rows * ScrambledSchema::STRIDE).columnar();
     buf.push(Scrambled { a: 10, b: 100, c: 200 });
     buf.push(Scrambled { a: 11, b: 101, c: 201 });
     buf.push(Scrambled { a: 12, b: 102, c: 202 });
@@ -619,8 +619,8 @@ fn scrambled_raw_layout() {
 
 #[test]
 fn scrambled_push_get_round_trip() {
-    let mut buf: ColumnarBuffer<ScrambledSchema, RingSlot> =
-        RingSlot::new(4 * ScrambledSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<ScrambledSchema, AlignedBox> =
+        AlignedBox::new(4 * ScrambledSchema::STRIDE).columnar();
     let rows = [
         Scrambled { a: 1, b: 1000, c: 100 },
         Scrambled { a: 2, b: 2000, c: 200 },
@@ -634,8 +634,8 @@ fn scrambled_push_get_round_trip() {
 
 #[test]
 fn scrambled_columns_access() {
-    let mut buf: ColumnarBuffer<ScrambledSchema, RingSlot> =
-        RingSlot::new(3 * ScrambledSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<ScrambledSchema, AlignedBox> =
+        AlignedBox::new(3 * ScrambledSchema::STRIDE).columnar();
     buf.push(Scrambled { a: 7, b: 77, c: 17 });
     buf.push(Scrambled { a: 8, b: 88, c: 18 });
     buf.push(Scrambled { a: 9, b: 99, c: 19 });
@@ -667,8 +667,8 @@ use grouped::schema as gs;
 
 #[test]
 fn group_push_get_round_trip() {
-    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
-        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<GroupedSchema, AlignedBox> =
+        AlignedBox::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
 
@@ -683,8 +683,8 @@ fn group_push_get_round_trip() {
 
 #[test]
 fn group_columns_access() {
-    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
-        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<GroupedSchema, AlignedBox> =
+        AlignedBox::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
     buf.push(Grouped { id: 3, elements: [12, 22, 32, 42] });
@@ -702,8 +702,8 @@ fn group_columns_access() {
 
 #[test]
 fn group_mixed_columns_access() {
-    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
-        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<GroupedSchema, AlignedBox> =
+        AlignedBox::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
 
@@ -717,8 +717,8 @@ fn group_mixed_columns_access() {
 
 #[test]
 fn group_mutate() {
-    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
-        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<GroupedSchema, AlignedBox> =
+        AlignedBox::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
 
@@ -735,8 +735,8 @@ fn group_mutate() {
 
 #[test]
 fn group_mutate_mixed() {
-    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
-        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<GroupedSchema, AlignedBox> =
+        AlignedBox::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
 
     buf.mutate((gs::id, gs::elements), |(ids, mut elems)| {
@@ -752,8 +752,8 @@ fn group_mutate_mixed() {
 #[test]
 fn group_raw_layout() {
     // Verify that sub-columns are stored transposed in memory
-    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
-        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<GroupedSchema, AlignedBox> =
+        AlignedBox::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.push(Grouped { id: 2, elements: [11, 21, 31, 41] });
     buf.push(Grouped { id: 3, elements: [12, 22, 32, 42] });
@@ -789,16 +789,16 @@ fn group_schema_total_blocks() {
 #[test]
 #[should_panic(expected = "duplicate columns")]
 fn group_duplicate_panics() {
-    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
-        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<GroupedSchema, AlignedBox> =
+        AlignedBox::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push(Grouped { id: 1, elements: [10, 20, 30, 40] });
     buf.mutate((gs::elements, gs::elements), |_| {});
 }
 
 #[test]
 fn group_push_with() {
-    let mut buf: ColumnarBuffer<GroupedSchema, RingSlot> =
-        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let mut buf: ColumnarBuffer<GroupedSchema, AlignedBox> =
+        AlignedBox::new(4 * GroupedSchema::STRIDE).columnar();
     buf.push_with((gs::id, gs::elements), |row, (ids, mut elems)| {
         ids[row] = 42;
         elems[0][row] = 10;
@@ -814,8 +814,8 @@ fn group_push_with() {
 
 #[test]
 fn group_empty_columns() {
-    let buf: ColumnarBuffer<GroupedSchema, RingSlot> =
-        RingSlot::new(4 * GroupedSchema::STRIDE).columnar();
+    let buf: ColumnarBuffer<GroupedSchema, AlignedBox> =
+        AlignedBox::new(4 * GroupedSchema::STRIDE).columnar();
     let (elems,) = buf.columns((gs::elements,));
     assert_eq!(elems[0].len(), 0);
     assert_eq!(elems[1].len(), 0);

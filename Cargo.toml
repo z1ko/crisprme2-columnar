@@ -3,6 +3,5 @@ resolver = "3"
 members = [
     "columnar-derive",
     "columnar", 
-    "columnar-bin",
     "columnar-python",
 ]

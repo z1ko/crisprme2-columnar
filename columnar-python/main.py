@@ -1,37 +1,17 @@
-import linecache
-import tracemalloc
 import columnar_python as col
 import numpy as np
 
-def display_top(snapshot, key_type='lineno', limit=10):
-    snapshot = snapshot.filter_traces((
-        tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
-        tracemalloc.Filter(False, "<unknown>"),
-    ))
-    top_stats = snapshot.statistics(key_type)
+def transform_batch(input: col.SequenceBatch, output: col.AlignmentBatch):
+    ids = np.asarray(input.ids())
+    occurences = np.asarray(output.occurences())
+    occurences[:] = ids[:] + 100
+    pass
 
-    print("Top %s lines" % limit)
-    for index, stat in enumerate(top_stats[:limit], 1):
-        frame = stat.traceback[0]
-        print("#%s: %s:%s: %.1f KiB"
-              % (index, frame.filename, frame.lineno, stat.size / 1024))
-        line = linecache.getline(frame.filename, frame.lineno).strip()
-        if line:
-            print('    %s' % line)
+pipeline = col.create_pipeline(
+    transform = transform_batch,
+)
+print(pipeline)
 
-    other = top_stats[limit:]
-    if other:
-        size = sum(stat.size for stat in other)
-        print("%s other: %.1f KiB" % (len(other), size / 1024))
-    total = sum(stat.size for stat in top_stats)
-    print("Total allocated size: %.1f KiB" % (total / 1024))
-
-tracemalloc.start()
-
-buffer = col.PyAlignmentBatch(1000000)
-
-occs = np.frombuffer(buffer.occurences(), dtype=np.uint32)
-print(occs)
-
-snapshot = tracemalloc.take_snapshot()
-display_top(snapshot)
+pipeline.submit()
+a = pipeline.receive()
+print(np.asarray(a.occurences()))
