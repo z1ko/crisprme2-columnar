@@ -1,18 +1,29 @@
-use std::{fmt::{Debug, Display}, sync::Arc, thread::JoinHandle};
+//! Multi-stage processing pipeline built on [`ring`](crate::ring) primitives.
+//!
+//! A [`Pipeline`] manages a set of named stages, each backed by one or more
+//! worker threads. Stages communicate via bounded connector channels and share
+//! memory through pooled batches — see [`crate::ring`] for details.
+
+use std::{fmt::Debug, sync::Arc, thread::JoinHandle};
 
 use crate::{
     buffer::Schema,
-    ring::{Batch, ConnectorRx, Pool},
+    ring::{Batch, ConnectorRx},
 };
 
-/// Shared resources available to stage handler functions.
+/// Shared context passed to every stage handler invocation.
+///
+/// Currently empty — reserved for future additions such as metrics counters,
+/// cancellation tokens, or per-worker state.
 pub struct StageContext {
 }
 
-/// Describes a stage
+/// A named group of worker threads that form one processing stage.
 pub struct Stage {
+    /// Human-readable stage name (used in thread names and debug output).
     pub name: String,
-    pub handles: Vec<JoinHandle<()>>
+    /// Join handles for the worker threads.
+    pub handles: Vec<JoinHandle<()>>,
 }
 
 impl Debug for Stage {
@@ -53,6 +64,7 @@ impl Drop for Pipeline {
 
 impl Pipeline {
 
+    /// Create an empty pipeline with no stages.
     pub fn new() -> Self {
         Self {
             stages: vec![],

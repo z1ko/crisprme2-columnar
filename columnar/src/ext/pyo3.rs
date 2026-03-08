@@ -1,8 +1,8 @@
 //! Zero-copy Python integration via the PEP 3118 buffer protocol.
 //!
-//! This module provides [`ColumnView`], a `#[pyclass]` that exposes a single
-//! column (or sub-column) of a [`Columnar`] buffer to Python as a
-//! `memoryview`-compatible object — no copies involved.
+//! This module provides `PyColumnView`, a `#[pyclass]` that exposes a single
+//! column (or sub-column) of a [`ColumnarBuffer`](crate::buffer::ColumnarBuffer)
+//! to Python as a `memoryview`-compatible object — no copies involved.
 //!
 //! On the Python side the returned object supports `memoryview()` and can be
 //! wrapped with `numpy.frombuffer()` for zero-copy array access.
@@ -13,7 +13,7 @@ use std::os::raw::c_int;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use crate::buffer::ColumnType;
+use crate::buffer::{ColumnIdx, ColumnGroupIdx, Schema};
 
 // =============================================================================
 // PyBufferFormat
@@ -55,7 +55,7 @@ impl_format!(f64, "d");
 // PyColumnView
 // =============================================================================
 
-/// A zero-copy view into a single column of a [`Columnar`] buffer.
+/// A zero-copy view into a single column of a `ColumnarBuffer`.
 ///
 /// Implements the PEP 3118 buffer protocol so that Python code can obtain a
 /// `memoryview` (or a numpy array via `numpy.frombuffer`) backed directly by
@@ -63,14 +63,14 @@ impl_format!(f64, "d");
 ///
 /// # Preventing garbage collection
 ///
-/// `PyColumnView` stores a [`PyObject`] reference to the owning Python wrapper
-/// (e.g. your `#[pyclass]` around `Columnar`). As long as the `PyColumnView`
-/// is alive, Python's GC will not collect the owner, keeping the backing
-/// memory valid.
+/// `PyColumnView` stores a `PyObject` reference to the owning Python wrapper
+/// (e.g. your `#[pyclass]` around `ColumnarBuffer`). As long as the
+/// `PyColumnView` is alive, Python's GC will not collect the owner, keeping
+/// the backing memory valid.
 ///
 /// # Safety contract
 ///
-/// The caller must ensure that the `Columnar` buffer is not reallocated or
+/// The caller must ensure that the `ColumnarBuffer` is not reallocated or
 /// dropped while any `PyColumnView` exists. In practice this means the Python
 /// wrapper should **not** expose `push` or other capacity-changing operations
 /// while column views are outstanding.
@@ -99,20 +99,18 @@ impl PyColumnView {
 
     /// Helper to get the PEP 3118 format string for a column token.
     #[inline]
-    pub fn format_for_column<C: ColumnType>(_col: C) -> &'static CStr
-    where
-        C::Value: PyBufferFormat,
-    {
-        C::Value::FORMAT
+    pub fn format_for_column<S: Schema, const IDX: usize, T: PyBufferFormat>(
+        _col: ColumnIdx<S, IDX, T>,
+    ) -> &'static CStr {
+        T::FORMAT
     }
 
     /// Helper to get the PEP 3118 format string for a group column token.
     #[inline]
-    pub fn format_for_group_column<const N: usize, G: crate::buffer::GroupColumnType<N>>(_col: G) -> &'static CStr
-    where
-        G::Value: PyBufferFormat,
-    {
-        G::Value::FORMAT
+    pub fn format_for_group_column<S: Schema, const IDX: usize, const N: usize, T: PyBufferFormat>(
+        _col: ColumnGroupIdx<S, IDX, N, T>,
+    ) -> &'static CStr {
+        T::FORMAT
     }
 
     /// Create a `ColumnView` from pre-computed raw values.
@@ -209,8 +207,8 @@ macro_rules! __pybatch_impl {
                     $(
                         (stringify!($method), None) => {
                             let col = $col;
-                            let offset = $crate::buffer::ColumnType::offset(col, capacity);
-                            let item_size = $crate::buffer::ColumnType::elem_size(col) as isize;
+                            let offset = col.offset(capacity);
+                            let item_size = col.elem_size() as isize;
                             let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
                             let format = $crate::ext::pyo3::PyColumnView::format_for_column(col);
                             let view = unsafe {
@@ -230,8 +228,8 @@ macro_rules! __pybatch_impl {
                                 ));
                             }
                             let col = $gcol;
-                            let offset = $crate::buffer::GroupColumnType::offset(col, k, capacity);
-                            let item_size = $crate::buffer::GroupColumnType::elem_size(col) as isize;
+                            let offset = col.offset(k, capacity);
+                            let item_size = col.elem_size() as isize;
                             let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
                             let format = $crate::ext::pyo3::PyColumnView::format_for_group_column(col);
                             let view = unsafe {
@@ -244,11 +242,11 @@ macro_rules! __pybatch_impl {
                         }
                         (stringify!($gmethod), None) => {
                             let col = $gcol;
-                            let item_size = $crate::buffer::GroupColumnType::elem_size(col) as isize;
+                            let item_size = col.elem_size() as isize;
                             let format = $crate::ext::pyo3::PyColumnView::format_for_group_column(col);
                             let mut views = Vec::with_capacity($gn);
                             for k in 0..$gn {
-                                let offset = $crate::buffer::GroupColumnType::offset(col, k, capacity);
+                                let offset = col.offset(k, capacity);
                                 let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
                                 let view = unsafe {
                                     $crate::ext::pyo3::PyColumnView::new_raw(

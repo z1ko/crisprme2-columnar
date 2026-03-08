@@ -1,14 +1,32 @@
+//! Memory pooling and typed batch passing for multi-stage pipelines.
+//!
+//! This module provides three main abstractions:
+//!
+//! - [`Pool`] — a fixed-size pool of pre-allocated [`AlignedBox`]
+//!   memory slots, preventing allocation churn in hot loops.
+//! - [`Batch`] — an `Arc`-wrapped columnar buffer with optional metadata,
+//!   cheaply clonable for fan-out between pipeline stages.
+//! - [`connector`] — bounded channel pairs ([`ConnectorTx`] / [`ConnectorRx`])
+//!   for passing batches between threads.
+
 use std::{marker::PhantomData, ops::Deref, sync::Arc, time::Duration};
 
 use crossbeam::channel::{Receiver, RecvError, RecvTimeoutError, SendError, Sender, bounded};
 
 use crate::buffer::{AlignedBox, ByteBuffer, ColumnarBuffer, Schema};
 
+/// Type alias for the raw memory slot managed by a [`Pool`].
 pub type PoolSlot = AlignedBox;
 
 /// A leased memory slot that automatically returns to the pool on drop.
+///
+/// Implements [`ByteBuffer`] so it can back a [`ColumnarBuffer`] directly.
+/// When dropped, the underlying [`PoolSlot`] is sent back to the pool's
+/// free-list via the stored channel sender.
 pub struct PoolSlotLease {
+    /// The leased memory; `None` only after `drop` has returned it.
     memory: Option<PoolSlot>,
+    /// Channel sender back to the pool's free-list.
     ret: Sender<PoolSlot>,
 }
 
@@ -20,7 +38,7 @@ impl Drop for PoolSlotLease {
     }
 }
 
-/// NOTE: Option<PoolSlot> is empty only after drop
+/// NOTE: `Option<PoolSlot>` is empty only after drop.
 impl ByteBuffer for PoolSlotLease {
 
     fn as_bytes_mut(&mut self) -> &mut [u8] {
@@ -173,6 +191,7 @@ impl<S: Schema, M> Clone for ConnectorTx<S, M> {
 }
 
 impl<S: Schema, M> ConnectorTx<S, M> {
+    /// Send a batch into the channel. Blocks if the channel is full.
     pub fn send(&self, batch: Batch<S, M>) -> Result<(), SendError<Batch<S, M>>> {
         self.0.send(batch)
     }
@@ -187,6 +206,8 @@ impl<S: Schema, M> Clone for ConnectorRx<S, M> {
 }
 
 impl<S: Schema, M> ConnectorRx<S, M> {
+    /// Block until a batch is available, or return `RecvError` if all senders
+    /// have been dropped.
     pub fn recv(&self) -> Result<Batch<S, M>, RecvError> {
         self.0.recv()
     }
