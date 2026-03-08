@@ -80,19 +80,21 @@ pub struct PyColumnView {
     _owner: Py<PyAny>,
     /// Raw pointer to the first element of this column's data.
     ptr: *mut u8,
-    /// Number of elements (rows) visible through this view.
-    len: isize,
     /// Size of a single element in bytes.
     item_size: isize,
     /// PEP 3118 format string (null-terminated).
     format: &'static CStr,
     /// Whether this view allows mutation.
     writable: bool,
+    /// Number of dimensions: 1 for scalar columns, 2 for `[T; N]` array columns.
+    ndim: c_int,
 
     // Buffer protocol requires stable addresses for shape/strides, so we
     // store them inline and hand out pointers to these fields.
-    shape: [isize; 1],
-    strides: [isize; 1],
+    // For 1D: shape[0] = rows, strides[0] = item_size.
+    // For 2D: shape = [rows, N], strides = [N * item_size, item_size].
+    shape: [isize; 2],
+    strides: [isize; 2],
 }
 
 impl PyColumnView {
@@ -134,12 +136,42 @@ impl PyColumnView {
         Self {
             _owner: owner,
             ptr,
-            len,
             item_size,
             format,
             writable,
-            shape: [len],
-            strides: [item_size],
+            ndim: 1,
+            shape: [len, 0],
+            strides: [item_size, 0],
+        }
+    }
+
+    /// Create a 2D view for a `[T; N]` array column.
+    ///
+    /// The resulting `memoryview` has shape `(rows, cols)` and C-contiguous
+    /// strides, directly usable as a 2D numpy array.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to valid memory for `rows * cols * item_size` bytes,
+    /// and must remain valid for the lifetime of `owner`.
+    pub unsafe fn new_raw_2d(
+        ptr: *mut u8,
+        rows: isize,
+        cols: isize,
+        item_size: isize,
+        format: &'static CStr,
+        writable: bool,
+        owner: Py<PyAny>,
+    ) -> Self {
+        Self {
+            _owner: owner,
+            ptr,
+            item_size,
+            format,
+            writable,
+            ndim: 2,
+            shape: [rows, cols],
+            strides: [cols * item_size, item_size],
         }
     }
 }
@@ -168,7 +200,8 @@ impl PyColumnView {
 macro_rules! __pybatch_impl {
     ($name:ident, $schema:ty,
      cols: [ $( $method:ident => $col:expr ),* ],
-     groups: [ $( $gmethod:ident [ $gn:expr ] => $gcol:expr ),* ]
+     groups: [ $( $gmethod:ident [ $gn:expr ] => $gcol:expr ),* ],
+     arrays: [ $( $amethod:ident [ $an:expr ] $aty:ty => $acol:expr ),* ]
     ) => {
 
         #[::pyo3::pyclass(str = "{batch:?}")]
@@ -259,6 +292,23 @@ macro_rules! __pybatch_impl {
                             Ok(::pyo3::types::PyList::new(py, views)?.into_any().unbind())
                         }
                     )*
+                    $(
+                        (stringify!($amethod), None) => {
+                            let col = $acol;
+                            let offset = col.offset(capacity);
+                            let item_size = ::std::mem::size_of::<$aty>() as isize;
+                            let cols = $an as isize;
+                            let ptr = unsafe { buf.storage.as_bytes().as_ptr().add(offset) as *mut u8 };
+                            let format = <$aty as $crate::ext::pyo3::PyBufferFormat>::FORMAT;
+                            let view = unsafe {
+                                $crate::ext::pyo3::PyColumnView::new_raw_2d(
+                                    ptr, len, cols, item_size, format, writable,
+                                    slf.clone_ref(py).into_any(),
+                                )
+                            };
+                            Ok(::pyo3::Py::new(py, view)?.into_any())
+                        }
+                    )*
                     _ => Err(::pyo3::exceptions::PyKeyError::new_err(
                         format!("unknown column: '{col_name}'")
                     )),
@@ -270,21 +320,46 @@ macro_rules! __pybatch_impl {
 
 #[macro_export]
 macro_rules! pybatch {
-    // With groups
+    // With groups and arrays
+    ($name:ident, $schema:ty,
+     { $( $method:ident => $col:expr ),* $(,)? },
+     groups: { $( $gmethod:ident [ $gn:expr ] => $gcol:expr ),* $(,)? },
+     arrays: { $( $amethod:ident [ $an:expr ] $aty:ty => $acol:expr ),* $(,)? }
+    ) => {
+        $crate::__pybatch_impl!($name, $schema,
+            cols: [ $( $method => $col ),* ],
+            groups: [ $( $gmethod [ $gn ] => $gcol ),* ],
+            arrays: [ $( $amethod [ $an ] $aty => $acol ),* ]
+        );
+    };
+    // With groups only
     ($name:ident, $schema:ty,
      { $( $method:ident => $col:expr ),* $(,)? },
      groups: { $( $gmethod:ident [ $gn:expr ] => $gcol:expr ),* $(,)? }
     ) => {
         $crate::__pybatch_impl!($name, $schema,
             cols: [ $( $method => $col ),* ],
-            groups: [ $( $gmethod [ $gn ] => $gcol ),* ]
+            groups: [ $( $gmethod [ $gn ] => $gcol ),* ],
+            arrays: []
         );
     };
-    // Without groups
+    // With arrays only
+    ($name:ident, $schema:ty,
+     { $( $method:ident => $col:expr ),* $(,)? },
+     arrays: { $( $amethod:ident [ $an:expr ] $aty:ty => $acol:expr ),* $(,)? }
+    ) => {
+        $crate::__pybatch_impl!($name, $schema,
+            cols: [ $( $method => $col ),* ],
+            groups: [],
+            arrays: [ $( $amethod [ $an ] $aty => $acol ),* ]
+        );
+    };
+    // Plain columns only
     ($name:ident, $schema:ty, { $( $method:ident => $col:expr ),* $(,)? }) => {
         $crate::__pybatch_impl!($name, $schema,
             cols: [ $( $method => $col ),* ],
-            groups: []
+            groups: [],
+            arrays: []
         );
     };
 }
@@ -310,13 +385,18 @@ impl PyColumnView {
 
         let v = unsafe { &mut *view };
         v.buf = self.ptr as *mut std::ffi::c_void;
-        v.len = self.len * self.item_size;
         v.itemsize = self.item_size;
         v.readonly = if self.writable { 0 } else { 1 };
-        v.ndim = 1;
+        v.ndim = self.ndim;
         v.format = self.format.as_ptr() as *mut _;
         v.shape = self.shape.as_ptr() as *mut _;
         v.strides = self.strides.as_ptr() as *mut _;
+
+        // Total byte length = product of shape dimensions * item_size
+        v.len = match self.ndim {
+            1 => self.shape[0] * self.item_size,
+            _ => self.shape[0] * self.shape[1] * self.item_size,
+        };
         v.suboffsets = std::ptr::null_mut();
         v.internal = std::ptr::null_mut();
 
