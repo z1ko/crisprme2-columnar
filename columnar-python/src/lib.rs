@@ -73,8 +73,17 @@ pub struct PyPipeline {
     pipeline: Pipeline,
     seq_pool: Arc<Pool<sequence::SequenceSchema>>,
 
-    src_tx: ConnectorTx<sequence::SequenceSchema, ()>,
-    out_rx: ConnectorRx<alignment::AlignmentSchema, ()>
+    src_tx: Option<ConnectorTx<sequence::SequenceSchema, ()>>,
+    out_rx: Option<ConnectorRx<alignment::AlignmentSchema, ()>>,
+}
+
+impl Drop for PyPipeline {
+    fn drop(&mut self) {
+        // Close channels first so worker threads unblock and exit,
+        // then Pipeline::drop can join them without deadlocking.
+        self.src_tx.take();
+        self.out_rx.take();
+    }
 }
 
 #[pymethods]
@@ -96,7 +105,7 @@ impl PyPipeline {
 
         // Release GIL so stage threads can acquire it
         py.detach(|| {
-            self.src_tx.send(input).unwrap();
+            self.src_tx.as_ref().unwrap().send(input).unwrap();
         });
 
         println!("Submission done!")
@@ -107,7 +116,9 @@ impl PyPipeline {
         println!("Receiving alignment batch...");
 
         // Release GIL so stage threads can acquire it while we block
-        let result = py.detach(|| self.out_rx.recv());
+        let rx = self.out_rx.as_ref()
+            .ok_or(PyRuntimeError::new_err("pipeline already shut down"))?;
+        let result = py.detach(|| rx.recv());
 
         match result {
             Ok(batch) => {
@@ -169,7 +180,7 @@ mod columnar_python {
             println!("run!");
         });
 
-        PyPipeline { pipeline, seq_pool, src_tx, out_rx }
+        PyPipeline { pipeline, seq_pool, src_tx: Some(src_tx), out_rx: Some(out_rx) }
     }
 
     #[pymodule_init]

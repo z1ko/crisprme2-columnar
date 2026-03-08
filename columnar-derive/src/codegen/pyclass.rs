@@ -118,15 +118,9 @@ pub fn generate(ir: &SchemaIR) -> TokenStream {
 
                 use ::columnar::buffer::ByteBuffer as _;
                 match key {
-                    #(
-                        #fields_simpl
-                    ),*
-                    #(
-                        #fields_array
-                    ),*
-                    #(
-                        #fields_group
-                    ),*
+                    #( #fields_simpl, )*
+                    #( #fields_array, )*
+                    #( #fields_group, )*
                     _ => Err(::pyo3::exceptions::PyKeyError::new_err(
                         format!("unknown column: '{key}'")
                     )),
