@@ -5,7 +5,7 @@
 //! (implemented by [`ConnectorTx`](crate::ring::ConnectorTx) and
 //! [`ConnectorRx`](crate::ring::ConnectorRx)).
 
-use std::{sync::Arc, thread::JoinHandle};
+use std::{sync::Arc, sync::atomic::{AtomicU64, Ordering}, thread::JoinHandle, time::Instant};
 
 // =============================================================================
 // Emit / Recv traits
@@ -68,12 +68,31 @@ pub trait Stage {
 }
 
 // =============================================================================
+// Metrics
+// =============================================================================
+
+/// Per-stage metrics collected automatically by the pipeline.
+#[derive(Default)]
+pub struct StageMetrics {
+    pub items_processed: AtomicU64,
+    pub processing_ns: AtomicU64,
+}
+
+/// Snapshot of a single stage's metrics.
+pub struct StageMetricsSnapshot {
+    pub name: String,
+    pub items_processed: u64,
+    pub processing_ns: u64,
+}
+
+// =============================================================================
 // Pipeline
 // =============================================================================
 
 struct StageDescriptor {
     handles: Vec<JoinHandle<()>>,
     name: String,
+    metrics: Arc<StageMetrics>,
 }
 
 /// A multi-stage processing pipeline with shared context.
@@ -116,7 +135,10 @@ impl<C: Send + Sync + 'static> Pipeline<C> {
         F: Fn(Arc<C>) -> S + Send + Sync  + 'static,
     {
         let mut handles = Vec::with_capacity(workers);
+
+        let metrics = Arc::new(StageMetrics::default());
         for _ in 0..workers {
+            let metrics = metrics.clone();
 
             let mut worker_emit = emit.clone();
             let mut worker_recv = recv.clone();
@@ -124,7 +146,13 @@ impl<C: Send + Sync + 'static> Pipeline<C> {
             let mut worker_stage = stage(self.ctx.clone());
             handles.push(std::thread::spawn(move || {
                 while let Some(input) = worker_recv.recv() {
-                    if worker_stage.process(input, &mut worker_emit).is_err() {
+                    let start = Instant::now();
+
+                    let result = worker_stage.process(input, &mut worker_emit);
+
+                    metrics.processing_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    metrics.items_processed.fetch_add(1, Ordering::Relaxed);
+                    if result.is_err() {
                         break;
                     }
                 }
@@ -134,7 +162,8 @@ impl<C: Send + Sync + 'static> Pipeline<C> {
         self.stages.push(
             StageDescriptor {
                 name: name.to_owned(),
-                handles
+                handles,
+                metrics,
             }
         );
     }
@@ -154,15 +183,21 @@ impl<C: Send + Sync + 'static> Pipeline<C> {
         let handler = Arc::new(handler);
         let mut handles = Vec::with_capacity(workers);
 
+        let metrics = Arc::new(StageMetrics::default());
         for _ in 0..workers {
+            let metrics = metrics.clone();
 
             let mut worker_emit = emit.clone();
             let mut worker_recv = recv.clone();
-            
+
             let handler = handler.clone();
             handles.push(std::thread::spawn(move || {
                 while let Some(input) = worker_recv.recv() {
-                    if handler(input, &mut worker_emit).is_err() {
+                    let start = Instant::now();
+                    let result = handler(input, &mut worker_emit);
+                    metrics.processing_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    metrics.items_processed.fetch_add(1, Ordering::Relaxed);
+                    if result.is_err() {
                         break;
                     }
                 }
@@ -172,9 +207,19 @@ impl<C: Send + Sync + 'static> Pipeline<C> {
         self.stages.push(
             StageDescriptor {
                 name: name.to_owned(),
-                handles
+                handles,
+                metrics,
             }
         );
+    }
+
+    /// Snapshot current metrics for all stages.
+    pub fn metrics(&self) -> Vec<StageMetricsSnapshot> {
+        self.stages.iter().map(|s| StageMetricsSnapshot {
+            name: s.name.clone(),
+            items_processed: s.metrics.items_processed.load(Ordering::Relaxed),
+            processing_ns: s.metrics.processing_ns.load(Ordering::Relaxed),
+        }).collect()
     }
 
     /// Wait for all stages to exit.
@@ -398,6 +443,36 @@ mod test {
         received.sort();
         assert_eq!(received, (0..8).collect::<Vec<u32>>());
         assert_eq!(processed.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn stage_metrics_collected() {
+        let pool = Arc::new(Pool::<data::RecordSchema>::new(4, 256));
+
+        let (src_tx, src_rx) = connector_mut::<data::RecordSchema, ()>(2);
+        let (out_tx, out_rx) = connector_mut::<data::RecordSchema, ()>(2);
+
+        let mut pipeline = Pipeline::new(());
+        pipeline.stage_fn("counted", 1, src_rx, out_tx.clone(), |batch, emit| {
+            emit.emit(batch)
+        });
+
+        let mut batch = pool.acquire().unwrap();
+        batch.mutate(
+            (data::schema::value,),
+            |(vals,): (&mut [u32],)| { vals[0] = 1; },
+        );
+        src_tx.send(batch).unwrap();
+        drop(src_tx);
+        drop(out_tx);
+
+        let _result = out_rx.recv().unwrap();
+
+        let snapshots = pipeline.metrics();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].name, "counted");
+        assert_eq!(snapshots[0].items_processed, 1);
+        assert!(snapshots[0].processing_ns > 0);
     }
 
     /// Slots return to the pool after pipeline drains
