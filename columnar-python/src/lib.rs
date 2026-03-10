@@ -5,7 +5,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use columnar::macros::Columnar;
 use columnar::buffer::Schema;
-use columnar::ring::{ConnectorRx, ConnectorTx, Pool};
+use columnar::ring::{BatchMut, ConnectorRx, ConnectorTx, Pool};
 
 const MAX_STR_LEN: usize = 32;
 const MAX_ANNOTATIONS_LEN: usize = 10;
@@ -70,11 +70,11 @@ pub use sequence::PySequenceBatch;
 #[pyclass(str = "{pipeline:?}")]
 pub struct PyPipeline {
 
-    pipeline: Pipeline,
+    pipeline: Pipeline<()>,
     seq_pool: Arc<Pool<sequence::SequenceSchema>>,
 
-    src_tx: Option<ConnectorTx<sequence::SequenceSchema, ()>>,
-    out_rx: Option<ConnectorRx<alignment::AlignmentSchema, ()>>,
+    src_tx: Option<ConnectorTx<BatchMut<sequence::SequenceSchema, ()>>>,
+    out_rx: Option<ConnectorRx<BatchMut<alignment::AlignmentSchema, ()>>>,
 }
 
 impl Drop for PyPipeline {
@@ -94,7 +94,7 @@ impl PyPipeline {
         println!("Submitting new sequence batch...");
 
         let mut input = self.seq_pool.acquire().unwrap();
-        input.as_mut().mutate(
+        input.mutate(
             (sequence::schema::id,),
             |(ids,)| {
                 for (i, id) in ids.iter_mut().enumerate() {
@@ -132,7 +132,7 @@ impl PyPipeline {
 
 #[pymodule]
 mod columnar_python {
-    use columnar::{ext::pyo3::PyColumnView, ring::connector};
+    use columnar::{ext::pyo3::PyColumnView, pipeline::Emit, ring::connector_mut};
     use pyo3::prelude::*;
     use crate::*;
 
@@ -149,21 +149,21 @@ mod columnar_python {
             Arc::new(Pool::<alignment::AlignmentSchema>::new(slots, elements))
         );
 
-        let mut pipeline = Pipeline::new();
+        let mut pipeline = Pipeline::new(());
 
-        let (src_tx, src_rx) = connector::<sequence::SequenceSchema, ()>(2);
-        let (out_tx, out_rx) = connector::<alignment::AlignmentSchema, ()>(2);
+        let (src_tx, src_rx) = connector_mut::<sequence::SequenceSchema, ()>(2);
+        let (out_tx, out_rx) = connector_mut::<alignment::AlignmentSchema, ()>(2);
 
         // Middle stage: Rust thread receives sequences, produces alignment batches,
         // calls Python callback for in-place transformation, then forwards downstream.
-        pipeline.stage("py-transform", src_rx, 1, move |input, _ctx| {
+        pipeline.stage_fn("py-transform", 1, src_rx, out_tx.clone(), move |input, emit| {
             println!("running py-transform...");
 
             let result = align_pool.acquire().unwrap();
             let alignments = PyAlignmentBatch { batch: Some(result) };
             let sequences = PySequenceBatch { batch: Some(input) };
 
-            Python::try_attach(|py| {
+            let output = Python::try_attach(|py| {
 
                 let py_input = Py::new(py, sequences).unwrap();
                 let py_batch = Py::new(py, alignments).unwrap();
@@ -172,12 +172,15 @@ mod columnar_python {
 
                 // Take the batch back after callback returns
                 let mut inner = py_batch.borrow_mut(py);
-                if let Some(batch) = inner.batch.take() {
-                    out_tx.send(batch).unwrap();
-                }
+                inner.batch.take()
             });
 
+            if let Some(Some(batch)) = output {
+                emit.emit(batch)?;
+            }
+
             println!("run!");
+            Ok(())
         });
 
         PyPipeline { pipeline, seq_pool, src_tx: Some(src_tx), out_rx: Some(out_rx) }

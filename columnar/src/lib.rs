@@ -10,7 +10,7 @@
 //! | Module | Purpose |
 //! |---|---|
 //! | [`buffer`] | Core types: [`Schema`](buffer::Schema), [`ColumnarBuffer`](buffer::ColumnarBuffer), [`ColumnIdx`](buffer::ColumnIdx), [`ColumnGroupIdx`](buffer::ColumnGroupIdx) |
-//! | [`ring`] | Memory pooling ([`Pool`](ring::Pool)) and batch passing ([`Batch`](ring::Batch), [`connector`](ring::connector)) |
+//! | [`ring`] | Memory pooling ([`Pool`](ring::Pool)) and batch passing ([`BatchMut`](ring::BatchMut), [`BatchRef`](ring::BatchRef), [`connector`](ring::connector)) |
 //! | [`pipeline`] | Multi-stage processing pipeline built on top of `ring` |
 //! | [`ext`] | Optional extensions (currently: PyO3 buffer-protocol integration) |
 //! | [`macros`] | Re-exports `#[derive(Columnar)]` from `columnar-derive` |

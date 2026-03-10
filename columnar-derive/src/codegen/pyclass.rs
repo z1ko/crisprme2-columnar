@@ -99,7 +99,7 @@ pub fn generate(ir: &SchemaIR) -> TokenStream {
 
         #[::pyo3::pyclass(str = "{batch:?}")]
         pub struct #pyclass_name {
-            pub batch: ::std::option::Option<::columnar::ring::Batch<#schema, ()>>,
+            pub batch: ::std::option::Option<::columnar::ring::BatchMut<#schema, ()>>,
         }
 
         #[::pyo3::pymethods]
@@ -111,8 +111,8 @@ pub fn generate(ir: &SchemaIR) -> TokenStream {
                 let batch = this.batch.as_ref()
                     .ok_or(::pyo3::exceptions::PyRuntimeError::new_err("batch consumed"))?;
 
-                let writable = batch.is_exclusive();
-                let buffer = batch.as_ref();
+                let writable = true;
+                let buffer = &**batch;
                 let capacity = buffer.capacity();
                 let len = buffer.len() as isize;
 

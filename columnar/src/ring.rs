@@ -4,16 +4,18 @@
 //!
 //! - [`Pool`] — a fixed-size pool of pre-allocated [`AlignedBox`]
 //!   memory slots, preventing allocation churn in hot loops.
-//! - [`Batch`] — an `Arc`-wrapped columnar buffer with optional metadata,
-//!   cheaply clonable for fan-out between pipeline stages.
+//! - [`BatchMut`] / [`BatchRef`] — mutable and shared columnar buffers
+//!   with optional metadata. `BatchMut` owns the buffer exclusively;
+//!   `BatchRef` wraps it in an `Arc` for cheap cloning and fan-out.
 //! - [`connector`] — bounded channel pairs ([`ConnectorTx`] / [`ConnectorRx`])
 //!   for passing batches between threads.
 
-use std::{marker::PhantomData, ops::Deref, sync::Arc, time::Duration};
+use std::{marker::PhantomData, ops::{Deref, DerefMut}, sync::Arc, time::Duration};
 
 use crossbeam::channel::{Receiver, RecvError, RecvTimeoutError, SendError, Sender, bounded};
 
 use crate::buffer::{AlignedBox, ByteBuffer, ColumnarBuffer, Schema};
+use crate::pipeline::{Emit, EmitError, Recv};
 
 /// Type alias for the raw memory slot managed by a [`Pool`].
 pub type PoolSlot = AlignedBox;
@@ -51,28 +53,86 @@ impl ByteBuffer for PoolSlotLease {
 }
 
 // =============================================================================
-// Batch
+// BatchMut
 // =============================================================================
 
-/// A unified batch type wrapping a columnar buffer with optional metadata.
+/// A mutable batch with exclusive ownership of the underlying buffer.
 ///
-/// Batches are `Arc`-wrapped so they can be cheaply cloned for fan-out.
-/// Mutable access requires sole ownership (`Arc::get_mut`), which panics
-/// if clones exist — indicating a pipeline misconfiguration.
-pub struct Batch<S: Schema, M> {
-    buffer: Arc<ColumnarBuffer<S, PoolSlotLease>>,
+/// Acquired from a [`Pool`]. Supports both read and write access to columns.
+/// Call [`freeze`](BatchMut::freeze) to convert into a shared [`BatchRef`].
+pub struct BatchMut<S: Schema, M> {
+    buffer: ColumnarBuffer<S, PoolSlotLease>,
     metadata: M,
 }
 
-impl<S: Schema, M: std::fmt::Debug> std::fmt::Debug for Batch<S, M> {
+impl<S: Schema, M: std::fmt::Debug> std::fmt::Debug for BatchMut<S, M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Batch")
+        f.debug_struct("BatchMut")
             .field("metadata", &self.metadata)
             .finish_non_exhaustive()
     }
 }
 
-impl<S: Schema, M: Clone> Clone for Batch<S, M> {
+impl<S: Schema, M> Deref for BatchMut<S, M> {
+    type Target = ColumnarBuffer<S, PoolSlotLease>;
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl<S: Schema, M> DerefMut for BatchMut<S, M> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
+    }
+}
+
+impl<S: Schema, M> BatchMut<S, M> {
+
+    /// Get a reference to the metadata.
+    pub fn metadata(&self) -> &M {
+        &self.metadata
+    }
+
+    /// Replace the metadata, keeping the same buffer.
+    pub fn with_metadata<M2>(self, metadata: M2) -> BatchMut<S, M2> {
+        BatchMut {
+            buffer: self.buffer,
+            metadata,
+        }
+    }
+
+    /// Convert into a shared, read-only [`BatchRef`] by wrapping in an `Arc`.
+    pub fn freeze(self) -> BatchRef<S, M> {
+        BatchRef {
+            buffer: Arc::new(self.buffer),
+            metadata: self.metadata,
+        }
+    }
+}
+
+// =============================================================================
+// BatchRef
+// =============================================================================
+
+/// A shared, read-only batch backed by an `Arc`.
+///
+/// Cheaply clonable for fan-out between pipeline stages.
+/// Call [`try_into_mut`](BatchRef::try_into_mut) to attempt recovering
+/// exclusive ownership as a [`BatchMut`].
+pub struct BatchRef<S: Schema, M> {
+    buffer: Arc<ColumnarBuffer<S, PoolSlotLease>>,
+    metadata: M,
+}
+
+impl<S: Schema, M: std::fmt::Debug> std::fmt::Debug for BatchRef<S, M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchRef")
+            .field("metadata", &self.metadata)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: Schema, M: Clone> Clone for BatchRef<S, M> {
     fn clone(&self) -> Self {
         Self {
             metadata: self.metadata.clone(),
@@ -81,46 +141,40 @@ impl<S: Schema, M: Clone> Clone for Batch<S, M> {
     }
 }
 
-impl<S: Schema, M> Deref for Batch<S, M> {
+impl<S: Schema, M> Deref for BatchRef<S, M> {
     type Target = ColumnarBuffer<S, PoolSlotLease>;
     fn deref(&self) -> &Self::Target {
         &self.buffer
     }
 }
 
-impl<S: Schema, M> Batch<S, M> {
-
-    /// Get mutable access to the underlying buffer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if other clones of this batch exist, indicating a pipeline
-    /// misconfiguration (multiple mutable references to the same buffer).
-    pub fn as_mut(&mut self) -> &mut ColumnarBuffer<S, PoolSlotLease> {
-        Arc::get_mut(&mut self.buffer)
-            .expect("pipeline error: multiple owners of mutable batch")
-    }
-
-    /// Get shared access to the underlying buffer.
-    pub fn as_ref(&self) -> &ColumnarBuffer<S, PoolSlotLease> {
-        &self.buffer
-    }
+impl<S: Schema, M> BatchRef<S, M> {
 
     /// Get a reference to the metadata.
     pub fn metadata(&self) -> &M {
         &self.metadata
     }
 
-    /// Returns `true` if this batch is the sole owner of the underlying buffer.
-    pub fn is_exclusive(&self) -> bool {
-        Arc::strong_count(&self.buffer) == 1
-    }
-
     /// Replace the metadata, keeping the same buffer.
-    pub fn with_metadata<M2>(self, metadata: M2) -> Batch<S, M2> {
-        Batch {
+    pub fn with_metadata<M2>(self, metadata: M2) -> BatchRef<S, M2> {
+        BatchRef {
             buffer: self.buffer,
             metadata,
+        }
+    }
+
+    /// Attempt to recover exclusive ownership. Returns `Err(self)` if
+    /// other clones of this batch exist.
+    pub fn try_into_mut(self) -> Result<BatchMut<S, M>, BatchRef<S, M>> {
+        match Arc::try_unwrap(self.buffer) {
+            Ok(buffer) => Ok(BatchMut {
+                buffer,
+                metadata: self.metadata,
+            }),
+            Err(buffer) => Err(BatchRef {
+                buffer,
+                metadata: self.metadata,
+            }),
         }
     }
 }
@@ -156,17 +210,17 @@ impl<S: Schema> Pool<S> {
         self.free_rx.len()
     }
 
-    /// Acquire a batch from the pool. Times out after 1 second to detect
-    /// pool starvation.
-    pub fn acquire(&self) -> Result<Batch<S, ()>, RecvTimeoutError> {
+    /// Acquire a mutable batch from the pool. Times out after 1 second to
+    /// detect pool starvation.
+    pub fn acquire(&self) -> Result<BatchMut<S, ()>, RecvTimeoutError> {
         let slot = self.free_rx.recv_timeout(Duration::from_secs(1))?;
         let lease = PoolSlotLease {
             memory: Some(slot),
             ret: self.free_tx.clone(),
         };
         let buffer = ColumnarBuffer::new_complete(lease);
-        Ok(Batch {
-            buffer: Arc::new(buffer),
+        Ok(BatchMut {
+            buffer,
             metadata: (),
         })
     }
@@ -176,40 +230,62 @@ impl<S: Schema> Pool<S> {
 // Connectors
 // =============================================================================
 
-/// Create a bounded connector channel pair for passing batches between pipeline stages.
-pub fn connector<S: Schema, M>(cap: usize) -> (ConnectorTx<S, M>, ConnectorRx<S, M>) {
+/// Create a bounded connector channel pair.
+pub fn connector<B>(cap: usize) -> (ConnectorTx<B>, ConnectorRx<B>) {
     let (tx, rx) = bounded(cap);
     (ConnectorTx(tx), ConnectorRx(rx))
 }
 
+/// Create a bounded connector for shared read-only batches.
+pub fn connector_ref<S: Schema, M>(cap: usize) -> (ConnectorTx<BatchRef<S, M>>, ConnectorRx<BatchRef<S, M>>) {
+    connector(cap)
+}
+
+/// Create a bounded connector for exclusively owned mutable batches.
+pub fn connector_mut<S: Schema, M>(cap: usize) -> (ConnectorTx<BatchMut<S, M>>, ConnectorRx<BatchMut<S, M>>) {
+    connector(cap)
+}
+
 /// Sending half of a connector. Clone to fan-in from multiple producers.
 /// When all `ConnectorTx` clones are dropped, receivers get `RecvError`.
-pub struct ConnectorTx<S: Schema, M>(Sender<Batch<S, M>>);
+pub struct ConnectorTx<B>(Sender<B>);
 
-impl<S: Schema, M> Clone for ConnectorTx<S, M> {
+impl<B> Clone for ConnectorTx<B> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<S: Schema, M> ConnectorTx<S, M> {
+impl<B> ConnectorTx<B> {
     /// Send a batch into the channel. Blocks if the channel is full.
-    pub fn send(&self, batch: Batch<S, M>) -> Result<(), SendError<Batch<S, M>>> {
+    pub fn send(&self, batch: B) -> Result<(), SendError<B>> {
         self.0.send(batch)
+    }
+}
+
+impl<B> Emit<B> for ConnectorTx<B> {
+    fn emit(&mut self, item: B) -> Result<(), EmitError> {
+        self.send(item).map_err(|_| EmitError)
     }
 }
 
 /// Receiving half of a connector. Clone to have multiple workers consume from the same channel.
 /// Returns `RecvError` when all senders are dropped.
-pub struct ConnectorRx<S: Schema, M>(Receiver<Batch<S, M>>);
+pub struct ConnectorRx<B>(Receiver<B>);
 
-impl<S: Schema, M> Clone for ConnectorRx<S, M> {
+impl<B> Clone for ConnectorRx<B> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<S: Schema, M> ConnectorRx<S, M> {
+impl<B> ConnectorRx<B> {
     /// Block until a batch is available, or return `RecvError` if all senders
     /// have been dropped.
-    pub fn recv(&self) -> Result<Batch<S, M>, RecvError> {
+    pub fn recv(&self) -> Result<B, RecvError> {
         self.0.recv()
+    }
+}
+
+impl<B> Recv<B> for ConnectorRx<B> {
+    fn recv(&mut self) -> Option<B> {
+        self.0.recv().ok()
     }
 }
 
@@ -243,7 +319,7 @@ mod test {
     }
 
     pub struct OutputMetadata {
-        pub source: Batch<src::InputSchema, ()>
+        pub source: BatchRef<src::InputSchema, ()>
     }
 
     #[test]
@@ -251,11 +327,11 @@ mod test {
         let pool = Pool::<src::InputSchema>::new(2, 128);
         let dst_pool = Pool::<dst::OutputSchema>::new(2, 128);
 
-        let (src_tx, src_rx) = connector::<src::InputSchema, ()>(2);
-        let (dst_tx, dst_rx) = connector::<dst::OutputSchema, OutputMetadata>(1);
+        let (src_tx, src_rx) = connector_mut::<src::InputSchema, ()>(2);
+        let (dst_tx, dst_rx) = connector_ref::<dst::OutputSchema, OutputMetadata>(1);
         {
             let mut batch = pool.acquire().unwrap();
-            batch.as_mut().mutate((src::schema::id,), |(ids,)| {
+            batch.mutate((src::schema::id,), |(ids,)| {
                 for id in ids {
                     *id = 9;
                 }
@@ -267,14 +343,15 @@ mod test {
             let input = src_rx.recv().unwrap();
             let mut output = dst_pool.acquire().unwrap();
 
-            output.as_mut().mutate((dst::schema::pos,), |(pos,): (&mut [u32],)| {
+            output.mutate((dst::schema::pos,), |(pos,): (&mut [u32],)| {
                 let (ids,): (&[u32],) = input.columns((src::schema::id,));
                 for (id, p) in ids.iter().zip(pos) {
                     *p = id * 2;
                 }
             });
 
-            let result = output.with_metadata(OutputMetadata { source: input });
+            let input = input.freeze();
+            let result = output.with_metadata(OutputMetadata { source: input }).freeze();
             dst_tx.send(result).unwrap();
         }
 
@@ -298,7 +375,7 @@ mod test {
     fn sole_owner_can_mutate() {
         let pool = Pool::<src::InputSchema>::new(1, 128);
         let mut batch = pool.acquire().unwrap();
-        batch.as_mut().mutate((src::schema::id,), |(ids,)| {
+        batch.mutate((src::schema::id,), |(ids,)| {
             ids[0] = 42;
         });
 
@@ -311,7 +388,7 @@ mod test {
 
         // Can get back to mutable
         let mut batch = batch.with_metadata(());
-        batch.as_mut().mutate((src::schema::id,), |(ids,)| {
+        batch.mutate((src::schema::id,), |(ids,)| {
             ids[0] = 99;
         });
         let (ids,): (&[u32],) = batch.columns((src::schema::id,));
@@ -319,11 +396,35 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "pipeline error")]
-    fn cloned_batch_panics_on_mut() {
+    fn freeze_and_try_into_mut() {
         let pool = Pool::<src::InputSchema>::new(1, 128);
         let mut batch = pool.acquire().unwrap();
-        let _clone = batch.clone();
-        batch.as_mut(); // should panic
+        batch.mutate((src::schema::id,), |(ids,)| {
+            ids[0] = 42;
+        });
+
+        // Freeze into shared ref
+        let shared = batch.freeze();
+        let (ids,): (&[u32],) = shared.columns((src::schema::id,));
+        assert_eq!(ids[0], 42);
+
+        // Sole owner can recover mutability
+        let mut batch = shared.try_into_mut().unwrap();
+        batch.mutate((src::schema::id,), |(ids,)| {
+            ids[0] = 99;
+        });
+        let (ids,): (&[u32],) = batch.columns((src::schema::id,));
+        assert_eq!(ids[0], 99);
+    }
+
+    #[test]
+    fn cloned_ref_cannot_become_mut() {
+        let pool = Pool::<src::InputSchema>::new(1, 128);
+        let batch = pool.acquire().unwrap();
+        let shared = batch.freeze();
+        let _clone = shared.clone();
+
+        // try_into_mut should fail because a clone exists
+        assert!(shared.try_into_mut().is_err());
     }
 }
